@@ -1,0 +1,11 @@
+# A Minecraft Launcher 运行依赖
+nicegui>=3.7,<4.0
+fastapi>=0.141,<1.0
+uvicorn>=0.44
+keyring>=25.7
+
+# 桌面窗口（native 模式）依赖；无 GUI 环境可省略，程序会自动降级为浏览器模式
+pywebview>=5.0
+
+# 打包（可选）
+pyinstaller>=6.0
