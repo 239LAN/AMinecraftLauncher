@@ -27,10 +27,11 @@ from engine.content_manager import (
 )
 from engine.crash_analyzer import CrashAnalyzer
 from engine.downloader import DownloadCancelled, Downloader
+from engine.hash_store import HashStore, HashStoreError
 from engine.java_manager import JavaError, JavaManager
 from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
-from engine.models import Account, FileEntry
+from engine.models import Account, FileEntry, GamePaths
 from engine.modpack import ModpackError, ModpackInstaller
 from engine.mod_provider import ModProvider, build_provider
 from engine.version_resolver import VersionResolver
@@ -59,9 +60,204 @@ class LauncherService:
         mirror_module.manager.install()
         threading.Thread(target=mirror_module.manager.probe, daemon=True).start()
 
+        # 哈希文件库：mcfile 存内容，.work 是运行期间的工作目录。
+        self.hash_store = HashStore(self.store.data_dir / "mcfile")
+        self.work_root = self.store.data_dir / ".work"
+        self.work_marker = self.store.data_dir / ".work-ready"
+        self.run_root = self.store.data_dir / ".run"
+        self._storage_lock = threading.RLock()
+        self._storage_closed = False
+        self._game_lock = threading.RLock()
+        self._game_process: Optional[subprocess.Popen] = None
+        self._game_version = ""
+        self._game_run_dir: Optional[Path] = None
+        if self.config.hash_store:
+            self._ensure_work_tree()
+
+    # ------------------------------------------------------------- 哈希文件库
+    def _materialize_work(self) -> int:
+        count = self.hash_store.materialize(self.work_root)
+        self.work_marker.write_text("1", encoding="utf-8")
+        return count
+
+    def _ensure_work_tree(self) -> None:
+        """确保工作目录存在；已有内容说明上次未同步，先回收再沿用。"""
+        if self.work_marker.exists():
+            self._capture_storage()
+            return
+        try:
+            count = self._materialize_work()
+            self.log(f"哈希存储：已物化 {count} 个文件到工作目录")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"哈希存储物化失败：{exc}")
+
+    def _capture_storage(self) -> None:
+        if not self.config.hash_store or self._storage_closed:
+            return
+        try:
+            result = self.hash_store.capture(self.work_root)
+            if any(result.values()):
+                self.log(
+                    "哈希存储同步：新增 {added}，变更 {changed}，移除 {removed}，"
+                    "写入哈希 {blobs}".format(**result)
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"哈希存储同步失败：{exc}")
+
+    def storage_status(self) -> dict:
+        status = self.hash_store.stats()
+        status["enabled"] = bool(self.config.hash_store)
+        status["game_root"] = str(Path(self.config.root))
+        status["work_dir"] = str(self.work_root)
+        status["running_game"] = self.has_running_game()
+        return status
+
+    def set_hash_store(self, enabled: bool) -> Task:
+        """开启 / 关闭哈希存储（带进度、原子迁移）。"""
+        enabled = bool(enabled)
+        game_root = Path(self.config.root)
+
+        def job(task: Task) -> None:
+            if enabled == self.config.hash_store:
+                task.log("哈希存储状态未变化")
+                return
+            if self.has_running_game():
+                raise RuntimeError("游戏正在运行，请先结束游戏再切换存储方式")
+            if enabled:
+                task.log("开始迁移到哈希存储（需要约 2 倍磁盘空间，请勿关闭启动器）")
+                self.hash_store.prune_runs(self.run_root)
+                if game_root.exists() and any(game_root.iterdir()):
+                    result = self.hash_store.migrate_in(game_root, self.work_root)
+                    self.work_marker.write_text("1", encoding="utf-8")
+                else:
+                    self._materialize_work()
+                    result = {}
+                self.config.hash_store = True
+                self.store.save(self.config)
+                task.result = {"hash_store": True, "migration": result}
+                task.log("已开启哈希存储；游戏文件无法被其它启动器读取")
+            else:
+                task.log("正在还原为普通 .minecraft 目录…")
+                self.hash_store.migrate_out(self.work_root, game_root)
+                self.work_marker.unlink(missing_ok=True)
+                self.config.hash_store = False
+                self.store.save(self.config)
+                task.result = {"hash_store": False}
+                task.log("已关闭哈希存储，文件已还原")
+
+        return self.tasks.create("切换哈希存储", job)
+
+    # ---------------------------------------------------------------- 游戏进程
+    def has_running_game(self) -> bool:
+        with self._game_lock:
+            return self._game_process is not None and self._game_process.poll() is None
+
+    def running_game_info(self) -> dict:
+        with self._game_lock:
+            if self._game_process is None or self._game_process.poll() is not None:
+                return {}
+            return {"version": self._game_version, "pid": self._game_process.pid}
+
+    def stop_game(self, *, timeout: float = 8.0) -> bool:
+        """结束游戏进程树；返回是否确实结束了一个运行中的进程。"""
+        with self._game_lock:
+            process = self._game_process
+        if process is None or process.poll() is not None:
+            return False
+        self.log(f"正在结束游戏进程 PID {process.pid}…")
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                process.terminate()
+            process.wait(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _register_game(self, process: subprocess.Popen, version: str, run_dir: Optional[Path]) -> None:
+        with self._game_lock:
+            self._game_process = process
+            self._game_version = version
+            self._game_run_dir = run_dir
+        if run_dir is not None:
+            threading.Thread(
+                target=self._watch_game, args=(process, run_dir), daemon=True
+            ).start()
+
+    def _watch_game(self, process: subprocess.Popen, run_dir: Path) -> None:
+        try:
+            process.wait()
+        except Exception:  # noqa: BLE001
+            return
+        self._finish_run(run_dir)
+
+    def _finish_run(self, run_dir: Path) -> None:
+        if self._storage_closed:
+            return
+        with self._storage_lock:
+            synced = False
+            try:
+                result = self.hash_store.capture(run_dir)
+                self._materialize_work()
+                self.log(
+                    "游戏已退出，文件已同步：新增 {added}，变更 {changed}，移除 {removed}".format(
+                        **result
+                    )
+                )
+                synced = True
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"游戏退出后同步失败（临时目录已保留）：{exc}")
+            finally:
+                if synced:
+                    self.hash_store.clear(run_dir)
+                with self._game_lock:
+                    self._game_process = None
+                    self._game_version = ""
+                    self._game_run_dir = None
+
+    def shutdown_storage(self) -> None:
+        """启动器退出前调用：结束游戏并回收工作目录。"""
+        self.stop_game()
+        if not self.config.hash_store or self._storage_closed:
+            return
+        self._storage_closed = True
+        with self._storage_lock:
+            try:
+                with self._game_lock:
+                    run_dir = self._game_run_dir
+                if run_dir is not None and Path(run_dir).exists():
+                    self.hash_store.capture(Path(run_dir))
+                    self.hash_store.clear(Path(run_dir))
+                self.hash_store.capture(self.work_root)
+                self.hash_store.clear(self.work_root)
+                self.work_marker.unlink(missing_ok=True)
+                self.hash_store.prune_runs(self.run_root)
+                self.log("哈希存储：工作目录已回收")
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"哈希存储回收失败（工作目录保留）：{exc}")
+
     # ------------------------------------------------------------------ 基础
     def log(self, line: str) -> None:
         self.tasks.log(line)
+
+    def _create_task(self, name: str, job: Callable[[Task], None]) -> Task:
+        """创建会改写游戏目录的任务；结束后自动同步哈希存储。"""
+
+        def wrapped(task: Task) -> None:
+            try:
+                job(task)
+            finally:
+                self._capture_storage()
+
+        return self.tasks.create(name, wrapped)
 
     @property
     def auth(self) -> AuthClient:
@@ -72,7 +268,9 @@ class LauncherService:
             )
         return self._auth
 
-    def paths(self):
+    def paths(self) -> GamePaths:
+        if self.config.hash_store:
+            return GamePaths(self.work_root, java=self.config.java)
         return self.config.to_game_paths()
 
     def resolver(self) -> VersionResolver:
@@ -253,7 +451,7 @@ class LauncherService:
             }
             task.log(f"安装完成：下载 {stats.files_downloaded} 个，跳过 {stats.files_skipped} 个")
 
-        return self.tasks.create(f"安装 {version}", job)
+        return self._create_task(f"安装 {version}", job)
 
     def start_repair(self, version: str) -> Task:
         """校验并补全某个已安装版本的文件（缺失 / 损坏的 jar、库、资源）。"""
@@ -291,7 +489,7 @@ class LauncherService:
                     f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
                 )
 
-        return self.tasks.create(f"补全 {version} 文件", job)
+        return self._create_task(f"补全 {version} 文件", job)
 
     def delete_version(self, version_id: str) -> dict:
         """删除已安装版本目录（含隔离的 mods / 存档 / 配置），并清理相关设置。"""
@@ -304,6 +502,7 @@ class LauncherService:
         if not target.is_dir():
             raise RuntimeError(f"版本不存在：{version_id}")
         shutil.rmtree(target)
+        self._capture_storage()
 
         changed = False
         if self.config.version_settings.pop(version_id, None) is not None:
@@ -361,7 +560,7 @@ class LauncherService:
             }
             task.log(f"加载器安装完成：{result.version_id}")
 
-        return self.tasks.create(f"安装 {label}", job)
+        return self._create_task(f"安装 {label}", job)
 
     # ------------------------------------------------------------------ Java
     def java_scan(self) -> list[dict]:
@@ -498,12 +697,27 @@ class LauncherService:
                     pass
 
         emit(1, "解析版本信息…")
-        paths = self.paths()
+        storage = bool(self.config.hash_store) and not dry_run
+        run_dir: Optional[Path] = None
+        if storage:
+            self._ensure_work_tree()
+            self._capture_storage()
+            emit(3, "准备临时游戏目录…")
+            self.hash_store.prune_runs(self.run_root)
+            run_dir = self.hash_store.new_run_dir(self.run_root)
+            try:
+                self.hash_store.materialize(run_dir)
+            except Exception:
+                self.hash_store.clear(run_dir)
+                raise
+            paths = GamePaths(run_dir, java=self.config.java)
+        else:
+            paths = self.paths()
         settings = self.config.merged_settings(version)
         isolated = bool(settings["isolated"])
         game_dir = paths.version_game_dir(version, isolated=isolated)
 
-        resolved = self.resolver().resolve(
+        resolved = VersionResolver(paths).resolve(
             version, include_assets=False, prefer_local=True, cancel=cancel
         )
 
@@ -564,9 +778,20 @@ class LauncherService:
         if os.name == "nt":
             # 避免 java.exe 在桌面上弹出黑色控制台窗口。
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(command, cwd=str(game_dir), **popen_kwargs)
+        try:
+            process = subprocess.Popen(command, cwd=str(game_dir), **popen_kwargs)
+        except Exception:
+            if run_dir is not None:
+                self.hash_store.clear(run_dir)
+            raise
+        self._register_game(process, version, run_dir)
         emit(100, f"已启动（PID {process.pid}）")
-        return {"pid": process.pid, "command": command, "account": account.username}
+        return {
+            "pid": process.pid,
+            "command": command,
+            "account": account.username,
+            "game_directory": str(game_dir),
+        }
 
     def _ensure_java(
         self,
@@ -863,7 +1088,7 @@ class LauncherService:
                 "skipped": stats.files_skipped > 0,
             }
 
-        return self.tasks.create(f"安装 {kind} {label}", job)
+        return self._create_task(f"安装 {kind} {label}", job)
 
     def start_mod_install(
         self,
@@ -917,6 +1142,7 @@ class LauncherService:
             isolated=self._is_isolated(version_id),
         )
         self.log(f"{'启用' if enabled else '禁用'} {kind}：{filename}")
+        self._capture_storage()
         return {"filename": item.filename, "enabled": item.enabled, "path": str(item.path)}
 
     def content_delete(self, kind: str, filename: str, version_id: Optional[str] = None) -> dict:
@@ -924,6 +1150,7 @@ class LauncherService:
             kind, filename, version_id=version_id, isolated=self._is_isolated(version_id)
         )
         self.log(f"删除 {kind}：{filename}")
+        self._capture_storage()
         return {"filename": filename, "deleted": True}
 
     def content_import(
@@ -945,6 +1172,7 @@ class LauncherService:
             overwrite=overwrite,
         )
         self.log(f"导入 {kind}：{target.name}")
+        self._capture_storage()
         return {"filename": target.name, "path": str(target)}
 
     def list_saves(self, version_id: Optional[str] = None) -> list[dict]:
@@ -961,6 +1189,7 @@ class LauncherService:
             name, version_id=version_id, isolated=self._is_isolated(version_id)
         )
         self.log(f"删除存档：{name}")
+        self._capture_storage()
         return {"name": name, "deleted": True}
 
     def list_screenshots(self, version_id: Optional[str] = None) -> list[dict]:
@@ -1011,7 +1240,7 @@ class LauncherService:
             }
             task.log(f"整合包导入完成：{info.name} → {version_id}")
 
-        return self.tasks.create(f"导入整合包 {archive.name}", job)
+        return self._create_task(f"导入整合包 {archive.name}", job)
 
     def export_modpack(
         self,
@@ -1108,7 +1337,7 @@ class LauncherService:
             }
             task.log(f"整合包安装完成：{info.name} → {target}")
 
-        return self.tasks.create(f"安装整合包 {label}", job)
+        return self._create_task(f"安装整合包 {label}", job)
 
     # ------------------------------------------------------------- 崩溃分析
     def analyze_crash(self, version_id: Optional[str] = None) -> dict:
@@ -1343,6 +1572,7 @@ class LauncherService:
         view["keyring_backend"] = self.secrets.backend_name
         view["installed_versions"] = sorted(self.installed_versions())
         view["mirror"] = self.mirror_status()
+        view["storage"] = self.storage_status()
         return view
 
     def supports(self) -> dict:

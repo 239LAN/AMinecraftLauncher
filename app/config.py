@@ -59,6 +59,8 @@ class LauncherConfig:
     download_source: str = "auto"
     # 全局默认是否开启版本隔离（每个版本可单独覆盖）
     isolated: bool = False
+    # 哈希文件库（实验性）：游戏文件按 SHA1 去重存放，启动时物化到临时目录。
+    hash_store: bool = False
     last_account: str = ""
     # 版本级覆盖：{version_id: {key: value}}，只存被显式修改过的项。
     version_settings: dict = field(default_factory=dict)

@@ -32,6 +32,19 @@ NAV_ITEMS = [
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
     {
+        "version": "1.1.0",
+        "title": "哈希存储 · 去重启动",
+        "notes": """\
+- 新增哈希存储（实验性）：游戏文件按 SHA1 去重存入 mcfile，文件树映射驱动启动
+- 启动时物化到临时目录（只读文件硬链接、可写文件复制），退出后同步并清理
+- 关闭启动器时先结束游戏并同步存档；系统关机时自动结束并尽力保存
+- 设置中可原子迁移开启 / 关闭，迁移需约 2 倍磁盘空间
+- 开启后游戏文件无法被其它启动器读取
+- 下载 / 安装时已存在的文件直接跳过，避免重复下载
+- 修复若干界面细节与存储边界问题
+""",
+    },
+    {
         "version": "1.0.1",
         "title": "界面重构 · CurseForge 镜像",
         "notes": """\
@@ -44,6 +57,8 @@ CHANGELOG = [
 - 创建任务后自动跳转任务页，结束后 3 秒自动移除
 - CurseForge 改走 mcimirror 公共镜像，无需 API Key
 - 修复边缘 CDN 证书链缺失导致的下载失败
+- 新增哈希存储（实验性）：SHA1 去重、临时目录启动、退出同步、原子迁移
+- 关闭启动器前会检查游戏进程，系统关机时直接结束游戏并尽力保存存档
 - 构建产物按版本目录分开保存，保留历史版本
 """,
     },
@@ -649,11 +664,50 @@ class LauncherUI:
             self._is_maximized = True
 
     def _win_close(self) -> None:
+        if self.service.has_running_game():
+            self._confirm_close_with_game()
+            return
+        if self.service.config.hash_store:
+            background_tasks.create(self._close_after_sync())
+            return
+        self._close_window()
+
+    def _close_window(self) -> None:
         # 原生窗口直接销毁；Web 模式退化为尝试关闭浏览器标签。
         ui.run_javascript("window.close()")
         window = self._native_window()
         if window is not None:
             window.destroy()
+
+    def _confirm_close_with_game(self) -> None:
+        info = self.service.running_game_info()
+
+        def builder() -> None:
+            ui.label(
+                "为了避免存档和数据丢失，关闭启动器前需结束游戏以保存游戏存档等数据。"
+            ).classes("text-[13px]")
+            ui.label(
+                f"正在运行：{info.get('version') or '游戏'}（PID {info.get('pid')}）"
+            ).classes("aml-sub")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button(
+                    "结束游戏并关闭", icon="power_settings_new",
+                    on_click=lambda: background_tasks.create(self._close_with_game()),
+                ).props("unelevated dense no-caps color=primary")
+
+        self.open_dialog("结束游戏并退出", builder)
+
+    async def _close_with_game(self) -> None:
+        self.dialog.close()
+        ui.notify("正在结束游戏并同步存档…", position="top-right")
+        await run.io_bound(self.service.shutdown_storage)
+        self._close_window()
+
+    async def _close_after_sync(self) -> None:
+        ui.notify("正在同步哈希文件库…", position="top-right")
+        await run.io_bound(self.service.shutdown_storage)
+        self._close_window()
 
     def _build_pages(self) -> None:
         with ui.element("div").classes("w-full flex-1 min-h-0"):
@@ -2123,7 +2177,14 @@ class LauncherUI:
                     self._refresh_home()
                     if self.current_view == "versions":
                         self._reload_version_list()
+                if "hash_store" in result and hasattr(self, "set_hash_store"):
+                    self.set_hash_store.value = bool(result["hash_store"])
+                    self.set_hash_store.update()
+                    self.storage_hint.text = self._storage_text(self.service.storage_status())
             elif status == "failed":
+                if snapshot.get("name") == "切换哈希存储" and hasattr(self, "set_hash_store"):
+                    self.set_hash_store.value = bool(self.service.config.hash_store)
+                    self.set_hash_store.update()
                 ui.notify(
                     f"{snapshot['name']} 失败：{snapshot.get('error') or '未知错误'}",
                     type="negative", position="top-right",
@@ -2442,6 +2503,18 @@ class LauncherUI:
             ).props("dense")
 
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            ui.label("存储方式（实验性）").classes("text-[14px] font-semibold")
+            self.set_hash_store = ui.switch(
+                "哈希文件库（按 SHA1 去重，启动时复制到临时目录）",
+                value=bool(view["storage"].get("enabled")),
+                on_change=self._on_hash_store_toggle,
+            ).props("dense")
+            self.storage_hint = ui.label(self._storage_text(view["storage"])).classes("aml-sub")
+            ui.label(
+                "注意：开启后游戏文件无法被其它启动器读取；关闭启动器前需结束游戏以保存存档。"
+            ).classes("aml-sub")
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
             ui.label("账号").classes("text-[14px] font-semibold")
             self.set_client_id = ui.input(
                 label="微软客户端 ID", value=view["client_id"]
@@ -2506,6 +2579,55 @@ class LauncherUI:
             f"当前下载源：{view['mirror'].get('active') or view['mirror'].get('source')}"
         )
         ui.notify("启动器设置已保存", type="positive", position="top-right")
+
+    def _storage_text(self, storage: dict) -> str:
+        if not storage.get("enabled"):
+            return "当前：普通目录（游戏文件直接保存在 .minecraft）"
+        return (
+            f"当前：哈希库 {storage.get('files', 0)} 个文件 · "
+            f"逻辑 {_fmt_size(storage.get('logical_bytes', 0))} · "
+            f"实际 {_fmt_size(storage.get('stored_bytes', 0))} · "
+            f"去重节省 {_fmt_size(storage.get('saved_bytes', 0))}"
+        )
+
+    def _on_hash_store_toggle(self, event) -> None:
+        enabled = bool(event.value)
+        if enabled == bool(self.service.config.hash_store):
+            return
+        title = "开启哈希存储" if enabled else "关闭哈希存储"
+
+        def builder() -> None:
+            if enabled:
+                ui.label(
+                    "将立即把现有游戏文件迁移进哈希库，需要约 2 倍磁盘空间，期间请勿关闭启动器。"
+                ).classes("text-[13px]")
+                ui.label(
+                    "迁移后这些文件无法被其它启动器读取；启动器关闭时会自动回收工作目录。"
+                ).classes("aml-sub")
+            else:
+                ui.label("将把哈希库还原成普通 .minecraft 文件，期间请勿关闭启动器。").classes(
+                    "text-[13px]"
+                )
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button(
+                    "取消", on_click=lambda: self._cancel_hash_store(enabled)
+                ).props("flat dense no-caps")
+                ui.button(
+                    "确认切换", icon="swap_horiz",
+                    on_click=lambda: self._start_hash_store(enabled),
+                ).props("unelevated dense no-caps color=primary")
+
+        self.open_dialog(title, builder)
+
+    def _cancel_hash_store(self, enabled: bool) -> None:
+        self.dialog.close()
+        self.set_hash_store.value = not enabled
+        self.set_hash_store.update()
+
+    def _start_hash_store(self, enabled: bool) -> None:
+        self.dialog.close()
+        self.service.set_hash_store(enabled)
+        ui.notify("已开始切换存储方式，进度见「任务」页", position="top-right")
 
     async def _apply_game_dir(self) -> None:
         raw = (self.set_root.value or "").strip()

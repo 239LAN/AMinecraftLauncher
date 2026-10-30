@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import multiprocessing
 import socket
 import sys
@@ -63,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     service = build_app(debug=args.debug)
+    # 关闭窗口 / 系统关机时结束游戏并回收哈希存储的工作目录。
+    atexit.register(service.shutdown_storage)
+    app.on_shutdown(service.shutdown_storage)
     port = args.port or _free_port()
 
     native = not args.web
