@@ -43,11 +43,12 @@ hiddenimports += [
     "app",
 ]
 
-# 图标（窗口 / exe）与界面 favicon；README 用于主页展示
+# 图标（窗口 / exe）与界面 favicon；README 与许可证随包分发
 datas += [
     ("assets/aml.ico", "assets"),
     ("assets/aml.png", "assets"),
     ("README.md", "."),
+    ("LICENSE", "."),
 ]
 
 analysis = Analysis(
