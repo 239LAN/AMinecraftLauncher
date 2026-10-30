@@ -1,0 +1,16 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 启动器运行数据与构建产物
+data/
+build/
+dist/
+
+# 编辑器 / 工具
+.vscode/
+.trae/
+.idea/
+*.log
