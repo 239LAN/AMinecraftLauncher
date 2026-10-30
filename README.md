@@ -77,7 +77,7 @@ python build.py
 ```
 
 产物输出到 `dist/<版本号>/A Minecraft Launcher.exe`，单文件便携版。  
-历史版本目录会保留，不会被后续构建覆盖。
+本地只保留最新一次构建，历史版本归档在 GitHub Releases。
 
 ## 测试
 

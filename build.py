@@ -3,11 +3,12 @@
 用法：
     python build.py
 
-历史版本目录会保留，不会互相覆盖。
+本地只保留最新版本；历史版本归档在 GitHub Releases。
 """
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -34,7 +35,13 @@ def main() -> int:
         str(work),
     ]
     print(f"构建 {APP_VERSION} -> {dist}")
-    return subprocess.call(command, cwd=ROOT)
+    code = subprocess.call(command, cwd=ROOT)
+    if code == 0:
+        # 本地只保留本次构建，旧版本目录清掉（仓库 Release 永久保留）。
+        for child in (ROOT / "dist").iterdir():
+            if child.is_dir() and child.name != APP_VERSION:
+                shutil.rmtree(child, ignore_errors=True)
+    return code
 
 
 if __name__ == "__main__":
