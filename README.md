@@ -2,7 +2,7 @@
 
 一个轻量、现代的 Minecraft 启动器，使用 NiceGUI + pywebview 构建。
 
-当前版本：**v1.1.0**
+当前版本：**v1.1.1**
 
 ## 功能
 
@@ -59,6 +59,7 @@ python main.py --debug
 在「设置 → 启动器设置 → 存储方式」中开启。开启后：
 
 - 游戏文件（版本、libraries、assets、mods、存档、日志等）全部按 SHA1 命名存入 `data/mcfile/`，相同内容只存一份；
+- 配置文件 / 存档 / 日志等可写文件用 zlib 压缩存储（带 `AMLZ` 魔数头），jar、libraries、assets 保持原样以支持硬链接；
 - `data/mcfile/tree.json` 保存「相对路径 → 哈希」的文件树映射；
 - 启动游戏时把文件树物化到 `data/.run/<id>/`：libraries/assets/jar 用硬链接，其余复制，退出后同步回文件库；
 - 启动器关闭时会结束仍在运行的游戏并同步存档，然后清空 `data/.work/`；

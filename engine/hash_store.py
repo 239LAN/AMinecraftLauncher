@@ -19,11 +19,17 @@ import os
 import shutil
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Optional
 
 TREE_VERSION = 1
 HASH_CHUNK = 1 << 20
+# 压缩块以 4 字节魔数开头，物化时据此判断是否需要解压。
+COMPRESS_MAGIC = b"AMLZ"
+COMPRESS_MIN_SIZE = 256
+# 运行目录完整物化后写入的标记，避免把半成品目录当成完整文件树采集。
+RUN_MARKER = ".aml-run-ready"
 
 # 只读目录优先硬链接，避免每次启动复制几十 GB。
 LINK_PREFIXES = ("libraries/", "assets/")
@@ -133,7 +139,7 @@ class HashStore:
                 dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__"}]
                 for name in filenames:
                     path = Path(dirpath) / name
-                    if name.endswith((".part", ".tmp")) or not path.is_file():
+                    if name == RUN_MARKER or name.endswith((".part", ".tmp")) or not path.is_file():
                         continue
                     rel = _safe_rel(path.relative_to(root).as_posix())
                     stat = path.stat()
@@ -148,8 +154,8 @@ class HashStore:
 
                     digest = sha1_file(path)
                     blob = self.blob_path(digest)
-                    if not blob.exists() or blob.stat().st_size != stat.st_size:
-                        self._write_blob(path, blob)
+                    if not blob.exists():
+                        self._write_blob(path, blob, compress=not _linkable(rel))
                         blobs_written += 1
                     if prev and prev.get("sha1") == digest:
                         changed += 1
@@ -173,11 +179,24 @@ class HashStore:
                 "blobs": blobs_written,
             }
 
-    def _write_blob(self, source: Path, blob: Path) -> None:
+    def _write_blob(self, source: Path, blob: Path, *, compress: bool) -> bool:
+        """写入哈希块；可压缩内容加魔数头，返回是否实际压缩。"""
         blob.parent.mkdir(parents=True, exist_ok=True)
         tmp = blob.with_name(blob.name + ".tmp")
-        shutil.copy2(source, tmp)
+        raw = source.read_bytes()
+        data = raw
+        packed = False
+        if compress and len(raw) >= COMPRESS_MIN_SIZE:
+            candidate = zlib.compress(raw, 6)
+            if len(candidate) + len(COMPRESS_MAGIC) < len(raw):
+                data = COMPRESS_MAGIC + candidate
+                packed = True
+        if packed:
+            tmp.write_bytes(data)
+        else:
+            shutil.copy2(source, tmp)
         os.replace(tmp, blob)
+        return packed
 
     def gc(self) -> int:
         """删除不再被文件树引用的哈希文件。"""
@@ -218,7 +237,12 @@ class HashStore:
                     continue
                 except OSError:
                     pass
-            shutil.copy2(blob, target)
+            with open(blob, "rb") as handle:
+                packed = handle.read(len(COMPRESS_MAGIC)) == COMPRESS_MAGIC
+            if packed:
+                target.write_bytes(zlib.decompress(blob.read_bytes()[len(COMPRESS_MAGIC):]))
+            else:
+                shutil.copy2(blob, target)
             try:
                 mtime = float(item.get("mtime") or 0)
                 if mtime:

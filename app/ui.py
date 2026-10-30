@@ -32,6 +32,17 @@ NAV_ITEMS = [
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
     {
+        "version": "1.1.1",
+        "title": "存储修复 · 压缩",
+        "notes": """\
+- 哈希库对配置 / 存档 / 日志等可写文件启用 zlib 压缩，jar 与资源继续硬链接
+- 修复 Web 模式关闭标签页时误清空工作目录的问题
+- 启动器异常退出后，下次启动会自动回收未同步的游戏目录
+- 哈希存储开启时禁止切换游戏目录；有任务进行时禁止切换存储方式
+- 启动前检查是否已有游戏在运行，避免重复启动
+""",
+    },
+    {
         "version": "1.1.0",
         "title": "哈希存储 · 去重启动",
         "notes": """\
@@ -664,6 +675,10 @@ class LauncherUI:
             self._is_maximized = True
 
     def _win_close(self) -> None:
+        if self._native_window() is None:
+            # Web 模式：关标签页不代表后端退出，不能在这里回收哈希存储。
+            self._close_window()
+            return
         if self.service.has_running_game():
             self._confirm_close_with_game()
             return

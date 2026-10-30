@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engine.hash_store import HashStore, HashStoreError
+from engine.hash_store import COMPRESS_MAGIC, HashStore, HashStoreError
 
 
 class HashStoreTests(unittest.TestCase):
@@ -88,6 +88,22 @@ class HashStoreTests(unittest.TestCase):
         self.assertFalse(work.exists())
         self.assertEqual((game_root / "mods" / "a.jar").read_bytes(), b"jar")
         self.assertEqual((game_root / "options.txt").read_text(encoding="utf-8"), "fov:90")
+
+    def test_compression_roundtrip(self) -> None:
+        work = self.root / "work"
+        work.mkdir()
+        payload = b"hello minecraft world " * 2000
+        (work / "saves" / "w").mkdir(parents=True)
+        (work / "saves" / "w" / "level.dat").write_bytes(payload)
+        self.store.capture(work)
+
+        blob = self.store.blob_path(self.store.entry("saves/w/level.dat")["sha1"])
+        self.assertLess(blob.stat().st_size, len(payload))
+        self.assertEqual(blob.read_bytes()[: len(COMPRESS_MAGIC)], COMPRESS_MAGIC)
+
+        out = self.root / "out"
+        self.store.materialize(out)
+        self.assertEqual((out / "saves/w/level.dat").read_bytes(), payload)
 
     def test_missing_blob_raises(self) -> None:
         work = self.root / "work"

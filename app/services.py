@@ -27,7 +27,7 @@ from engine.content_manager import (
 )
 from engine.crash_analyzer import CrashAnalyzer
 from engine.downloader import DownloadCancelled, Downloader
-from engine.hash_store import HashStore, HashStoreError
+from engine.hash_store import HashStore, HashStoreError, RUN_MARKER
 from engine.java_manager import JavaError, JavaManager
 from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
@@ -72,7 +72,32 @@ class LauncherService:
         self._game_version = ""
         self._game_run_dir: Optional[Path] = None
         if self.config.hash_store:
-            self._ensure_work_tree()
+            recovered = self._recover_runs()
+            self._ensure_work_tree(recovered)
+
+    def _recover_runs(self) -> bool:
+        """启动时回收上次未同步的运行目录；只信任带完成标记的目录。"""
+        if not self.run_root.exists():
+            return False
+        recovered = False
+        for path in self.run_root.iterdir():
+            if not path.is_dir():
+                continue
+            if not (path / RUN_MARKER).exists():
+                # 半成品目录只是物化过程中的副本，哈希库仍然完整。
+                self.hash_store.clear(path)
+                continue
+            try:
+                result = self.hash_store.capture(path)
+                self.log(
+                    f"已恢复上次未同步的游戏目录 {path.name}：新增 {result['added']}，"
+                    f"变更 {result['changed']}"
+                )
+                self.hash_store.clear(path)
+                recovered = True
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"恢复 {path.name} 失败（目录保留）：{exc}")
+        return recovered
 
     # ------------------------------------------------------------- 哈希文件库
     def _materialize_work(self) -> int:
@@ -80,9 +105,9 @@ class LauncherService:
         self.work_marker.write_text("1", encoding="utf-8")
         return count
 
-    def _ensure_work_tree(self) -> None:
+    def _ensure_work_tree(self, refresh: bool = False) -> None:
         """确保工作目录存在；已有内容说明上次未同步，先回收再沿用。"""
-        if self.work_marker.exists():
+        if self.work_marker.exists() and not refresh:
             self._capture_storage()
             return
         try:
@@ -123,6 +148,14 @@ class LauncherService:
                 return
             if self.has_running_game():
                 raise RuntimeError("游戏正在运行，请先结束游戏再切换存储方式")
+            busy = [
+                item
+                for item in self.tasks.list_snapshots(limit=50)
+                if item.get("id") != task.id
+                and item.get("status") in {TaskStatus.PENDING.value, TaskStatus.RUNNING.value}
+            ]
+            if busy:
+                raise RuntimeError("还有任务正在进行，请等待完成后再切换存储方式")
             if enabled:
                 task.log("开始迁移到哈希存储（需要约 2 倍磁盘空间，请勿关闭启动器）")
                 self.hash_store.prune_runs(self.run_root)
@@ -202,6 +235,14 @@ class LauncherService:
     def _finish_run(self, run_dir: Path) -> None:
         if self._storage_closed:
             return
+        if not (run_dir / RUN_MARKER).exists():
+            # 物化未完成就退出的目录不可信，直接丢弃（哈希库仍然完整）。
+            self.hash_store.clear(run_dir)
+            with self._game_lock:
+                self._game_process = None
+                self._game_version = ""
+                self._game_run_dir = None
+            return
         with self._storage_lock:
             synced = False
             try:
@@ -234,8 +275,11 @@ class LauncherService:
                 with self._game_lock:
                     run_dir = self._game_run_dir
                 if run_dir is not None and Path(run_dir).exists():
-                    self.hash_store.capture(Path(run_dir))
+                    if (Path(run_dir) / RUN_MARKER).exists():
+                        self.hash_store.capture(Path(run_dir))
                     self.hash_store.clear(Path(run_dir))
+                # 其它残留的运行目录也先回收，再统一清理。
+                self._recover_runs()
                 self.hash_store.capture(self.work_root)
                 self.hash_store.clear(self.work_root)
                 self.work_marker.unlink(missing_ok=True)
@@ -696,6 +740,9 @@ class LauncherService:
                 except Exception:  # noqa: BLE001 - 进度回调不影响启动
                     pass
 
+        if self.has_running_game():
+            raise RuntimeError("游戏正在运行，请先结束当前游戏再启动新实例")
+
         emit(1, "解析版本信息…")
         storage = bool(self.config.hash_store) and not dry_run
         run_dir: Optional[Path] = None
@@ -707,6 +754,7 @@ class LauncherService:
             run_dir = self.hash_store.new_run_dir(self.run_root)
             try:
                 self.hash_store.materialize(run_dir)
+                (run_dir / RUN_MARKER).write_text("1", encoding="utf-8")
             except Exception:
                 self.hash_store.clear(run_dir)
                 raise
@@ -1552,6 +1600,8 @@ class LauncherService:
                 setattr(self.config, key, value)
 
         if "root" in changes and changes["root"]:
+            if self.config.hash_store:
+                raise RuntimeError("哈希存储开启时不能切换游戏目录，请先关闭哈希存储")
             new_root = str(Path(str(changes["root"])).expanduser().resolve())
             self.config.root = new_root
             # 新游戏目录立即创建标准结构；账户清单固定在启动器数据目录，不随游戏目录移动。
