@@ -77,8 +77,7 @@ python main.py --debug
 python build.py
 ```
 
-产物输出到 `dist/<版本号>/A Minecraft Launcher.exe`，单文件便携版。  
-本地只保留最新一次构建，历史版本归档在 GitHub Releases。
+产物输出到 `dist/<版本号>/A Minecraft Launcher.exe`，单文件便携版。
 
 ## 测试
 

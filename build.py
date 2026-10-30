@@ -2,8 +2,6 @@
 
 用法：
     python build.py
-
-本地只保留最新版本；历史版本归档在 GitHub Releases。
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ def main() -> int:
     print(f"构建 {APP_VERSION} -> {dist}")
     code = subprocess.call(command, cwd=ROOT)
     if code == 0:
-        # 本地只保留本次构建，旧版本目录清掉（仓库 Release 永久保留）。
+        # 清理其它版本目录。
         for child in (ROOT / "dist").iterdir():
             if child.is_dir() and child.name != APP_VERSION:
                 shutil.rmtree(child, ignore_errors=True)
