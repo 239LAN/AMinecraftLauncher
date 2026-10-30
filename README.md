@@ -1,0 +1,85 @@
+# A Minecraft Launcher
+
+一个轻量、现代的 Minecraft 启动器，使用 NiceGUI + pywebview 构建。
+
+当前版本：**v1.0.1**
+
+## 功能
+
+- **启动**：离线登录、选择版本、一键启动，启动过程显示实时进度；左侧为可折叠的更新日志。
+- **版本管理**：本地版本列表、版本隔离、补全缺失文件、删除版本、崩溃日志诊断。
+- **下载中心**：安装官方游戏版本；按本地版本自动筛选并下载 Mod、资源包、光影包；支持整合包在线安装与本地导入。
+- **Java 管理**：自动检测本机 Java，缺少对应版本时自动下载安装，也可手动指定路径。
+- **下载加速**：多线程并发 + 大文件分片下载 + 断点续传，支持 BMCLAPI 镜像自动回退官方源。
+- **任务中心**：统一展示下载 / 安装进度、总速度、已完成大小；任务完成后自动清理。
+- **设置**：启动器设置与游戏设置分离，可修改游戏目录、下载源、内存、窗口尺寸等。
+
+## 快速开始
+
+环境要求：Python 3.11+，Windows 10/11（桌面窗口依赖 WebView2）。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+
+浏览器模式（无桌面环境或调试时）：
+
+```powershell
+python main.py --web
+```
+
+显示运行日志面板：
+
+```powershell
+python main.py --debug
+```
+
+## 数据目录
+
+所有运行数据保存在启动器同级目录的 `data/` 中：
+
+| 路径 | 内容 |
+| --- | --- |
+| `data/launcher_config.json` | 启动器配置 |
+| `data/accounts.json` | 本地账号 |
+| `data/.minecraft/` | 游戏文件（版本、libraries、assets、mods 等） |
+| `data/runtimes/` | 自动下载的 Java 运行时 |
+| `data/modpacks/` | 导入或下载的整合包归档 |
+
+整个 `data/` 可以随启动器一起拷贝，实现便携使用。
+
+## 构建
+
+```powershell
+python build.py
+```
+
+产物输出到 `dist/<版本号>/A Minecraft Launcher.exe`，单文件便携版。  
+历史版本目录会保留，不会被后续构建覆盖。
+
+## 测试
+
+```powershell
+python -m unittest discover -s tests -q
+```
+
+## 目录结构
+
+```text
+app/        应用层：配置、任务、服务编排、API、NiceGUI 界面
+engine/     引擎层：版本解析、下载、启动、Java、整合包、内容管理
+tests/      单元测试
+assets/     图标资源
+main.py     程序入口
+build.py    版本化构建脚本
+cli.py      引擎命令行工具
+```
+
+## 说明
+
+- 仅支持离线登录；微软 / 外置登录的底层能力保留，界面暂未开放。
+- 自动安装 Java 依赖 Adoptium API，网络不可达时请手动在设置中指定 Java。
+- 本项目未附带 LICENSE 文件，分发前请自行确认授权范围。
