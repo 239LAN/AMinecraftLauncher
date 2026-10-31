@@ -327,9 +327,9 @@ class LoaderInstaller:
         version_dir = self.paths.version_dir(version_id)
         version_dir.mkdir(parents=True, exist_ok=True)
         profile_path = self.paths.version_json(version_id)
-        profile_path.write_text(
-            json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp = profile_path.with_name(profile_path.name + ".tmp")
+        tmp.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, profile_path)
         if progress:
             progress("profile", 1, 1)
         if log:
@@ -450,10 +450,16 @@ class LoaderInstaller:
             if progress:
                 progress("download", done, 0)
 
-        net.download_file(url, dest, on_chunk=_on_chunk, timeout=self.timeout)
+        net.download_file(
+            url, dest, on_chunk=_on_chunk, timeout=self.timeout, cancel=cancel
+        )
 
     def _run_installer(self, installer_path: Path, log: Optional[LogFn]) -> None:
         """用 Java 运行安装器，stdout 逐行喂给 log。"""
+        kwargs: dict = {}
+        if os.name == "nt":
+            # 安装器在后台运行，不弹出黑色控制台窗口。
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             proc = subprocess.run(
                 [
@@ -465,7 +471,10 @@ class LoaderInstaller:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=INSTALLER_TIMEOUT,
+                **kwargs,
             )
         except FileNotFoundError as exc:
             raise LoaderError(f"找不到 Java：{self.java}") from exc

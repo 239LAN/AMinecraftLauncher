@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,12 +28,12 @@ from engine.content_manager import (
 )
 from engine.crash_analyzer import CrashAnalyzer
 from engine.downloader import DownloadCancelled, Downloader
-from engine.hash_store import HashStore, HashStoreError, RUN_MARKER
-from engine.java_manager import JavaError, JavaManager
+from engine.hash_store import HashStore, RUN_MARKER
+from engine.java_manager import JavaManager
 from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
 from engine.models import Account, FileEntry, GamePaths
-from engine.modpack import ModpackError, ModpackInstaller
+from engine.modpack import ModpackInstaller
 from engine.mod_provider import ModProvider, build_provider
 from engine.version_resolver import VersionResolver
 
@@ -67,6 +68,9 @@ class LauncherService:
         self.run_root = self.store.data_dir / ".run"
         self._storage_lock = threading.RLock()
         self._storage_closed = False
+        self._modpack_lock = threading.Lock()
+        # 不同版本的安装会同时写同一批 libraries / assets，串行化避免写坏共享文件。
+        self._files_lock = threading.Lock()
         self._game_lock = threading.RLock()
         self._game_process: Optional[subprocess.Popen] = None
         self._game_version = ""
@@ -156,27 +160,29 @@ class LauncherService:
             ]
             if busy:
                 raise RuntimeError("还有任务正在进行，请等待完成后再切换存储方式")
-            if enabled:
-                task.log("开始迁移到哈希存储（需要约 2 倍磁盘空间，请勿关闭启动器）")
-                self.hash_store.prune_runs(self.run_root)
-                if game_root.exists() and any(game_root.iterdir()):
-                    result = self.hash_store.migrate_in(game_root, self.work_root)
-                    self.work_marker.write_text("1", encoding="utf-8")
+            task.emit({"type": "phase", "phase": "storage", "done": 0, "total": 0})
+            with self._task_lock(self._files_lock, task):
+                if enabled:
+                    task.log("开始迁移到哈希存储（需要约 2 倍磁盘空间，请勿关闭启动器）")
+                    self.hash_store.prune_runs(self.run_root)
+                    if game_root.exists() and any(game_root.iterdir()):
+                        result = self.hash_store.migrate_in(game_root, self.work_root)
+                        self.work_marker.write_text("1", encoding="utf-8")
+                    else:
+                        self._materialize_work()
+                        result = {}
+                    self.config.hash_store = True
+                    self.store.save(self.config)
+                    task.result = {"hash_store": True, "migration": result}
+                    task.log("已开启哈希存储；游戏文件无法被其它启动器读取")
                 else:
-                    self._materialize_work()
-                    result = {}
-                self.config.hash_store = True
-                self.store.save(self.config)
-                task.result = {"hash_store": True, "migration": result}
-                task.log("已开启哈希存储；游戏文件无法被其它启动器读取")
-            else:
-                task.log("正在还原为普通 .minecraft 目录…")
-                self.hash_store.migrate_out(self.work_root, game_root)
-                self.work_marker.unlink(missing_ok=True)
-                self.config.hash_store = False
-                self.store.save(self.config)
-                task.result = {"hash_store": False}
-                task.log("已关闭哈希存储，文件已还原")
+                    task.log("正在还原为普通 .minecraft 目录…")
+                    self.hash_store.migrate_out(self.work_root, game_root)
+                    self.work_marker.unlink(missing_ok=True)
+                    self.config.hash_store = False
+                    self.store.save(self.config)
+                    task.result = {"hash_store": False}
+                    task.log("已关闭哈希存储，文件已还原")
 
         return self.tasks.create("切换哈希存储", job)
 
@@ -292,6 +298,115 @@ class LauncherService:
     def log(self, line: str) -> None:
         self.tasks.log(line)
 
+    def _loader_java(self, task: Task, game_version: str) -> str:
+        """Forge / NeoForge 安装器需要能运行对应版本的 Java，这里按原版要求准备。"""
+        try:
+            resolved = self.resolver().resolve(
+                game_version,
+                include_assets=False,
+                prefer_local=True,
+                cancel=task.check_cancel,
+            )
+            required = resolved.java_major
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 拿不到版本信息时退回当前配置
+            task.log(f"无法确定 {game_version} 所需的 Java 版本：{exc}")
+            return self.config.java
+
+        def on_progress(event: dict) -> None:
+            task.emit(
+                {
+                    "type": "phase",
+                    "phase": "java",
+                    "done": int(event.get("percent") or 0),
+                    "total": 100,
+                }
+            )
+
+        try:
+            return self._ensure_java(
+                required, self.config.java, progress=on_progress, cancel=task.check_cancel
+            )
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Java 准备失败时仍尝试现有配置
+            task.log(f"Java {required}+ 准备失败（将尝试当前配置）：{exc}")
+            return self.config.java
+
+    def _game_files_busy(self) -> bool:
+        """是否有任务正在改写游戏本体文件（安装 / 补全 / 加载器 / 整合包）。"""
+        active = {TaskStatus.PENDING.value, TaskStatus.RUNNING.value}
+        content_prefixes = (
+            "安装 mod ",
+            "安装 resourcepack ",
+            "安装 shader ",
+            "安装 datapack ",
+            "安装 Java ",
+        )
+        for snapshot in self.tasks.list_snapshots(limit=50):
+            if snapshot.get("status") not in active:
+                continue
+            name = str(snapshot.get("name") or "")
+            if name.startswith(content_prefixes):
+                continue
+            if name.startswith(("安装 ", "补全 ", "导入整合包 ", "安装整合包 ")):
+                return True
+        return False
+
+    def _find_active_task(self, name: str) -> Optional[Task]:
+        """同名任务还在跑时直接复用它，避免两个线程写同一批文件。"""
+        active = {TaskStatus.PENDING.value, TaskStatus.RUNNING.value}
+        for snapshot in self.tasks.list_snapshots(limit=50):
+            if snapshot.get("status") in active and snapshot.get("name") == name:
+                return self.tasks.get(snapshot["id"])
+        return None
+
+    @contextmanager
+    def _task_lock(self, lock: threading.Lock, task: Task):
+        """等待锁期间也响应取消，避免用户在排队时「点了取消没反应」。"""
+        while not lock.acquire(timeout=0.5):
+            if task.check_cancel():
+                raise DownloadCancelled("已取消")
+        try:
+            if task.check_cancel():
+                raise DownloadCancelled("已取消")
+            yield
+        finally:
+            lock.release()
+
+    def _serialized_modpack(self, job: Callable[[Task], None]) -> Callable[[Task], None]:
+        """整合包会向同一加载器版本写入内容，串行执行避免两个包互相覆盖。"""
+
+        def run(task: Task) -> None:
+            if task.check_cancel():
+                raise DownloadCancelled("已取消")
+            if self._modpack_lock.locked():
+                task.emit({"type": "phase", "phase": "wait", "done": 0, "total": 0})
+                task.log("等待其它整合包安装完成…")
+            with self._task_lock(self._modpack_lock, task):
+                if self._files_lock.locked():
+                    task.emit({"type": "phase", "phase": "waitfiles", "done": 0, "total": 0})
+                    task.log("等待其它游戏文件安装任务完成…")
+                with self._task_lock(self._files_lock, task):
+                    job(task)
+
+        return run
+
+    def _serialized_files(self, job: Callable[[Task], None]) -> Callable[[Task], None]:
+        """游戏文件安装任务串行执行，避免并发下载同一个 libraries / assets 文件。"""
+
+        def run(task: Task) -> None:
+            if task.check_cancel():
+                raise DownloadCancelled("已取消")
+            if self._files_lock.locked():
+                task.emit({"type": "phase", "phase": "waitfiles", "done": 0, "total": 0})
+                task.log("等待其它游戏文件安装任务完成…")
+            with self._task_lock(self._files_lock, task):
+                job(task)
+
+        return run
+
     def _create_task(self, name: str, job: Callable[[Task], None]) -> Task:
         """创建会改写游戏目录的任务；结束后自动同步哈希存储。"""
 
@@ -299,6 +414,9 @@ class LauncherService:
             try:
                 job(task)
             finally:
+                if self.config.hash_store and not self._storage_closed:
+                    # 下载完成后的哈希入库可能较久，给界面一个明确阶段。
+                    task.emit({"type": "phase", "phase": "hashsync", "done": 0, "total": 0})
                 self._capture_storage()
 
         return self.tasks.create(name, wrapped)
@@ -495,7 +613,9 @@ class LauncherService:
             }
             task.log(f"安装完成：下载 {stats.files_downloaded} 个，跳过 {stats.files_skipped} 个")
 
-        return self._create_task(f"安装 {version}", job)
+        name = f"安装 {version}"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, self._serialized_files(job))
 
     def start_repair(self, version: str) -> Task:
         """校验并补全某个已安装版本的文件（缺失 / 损坏的 jar、库、资源）。"""
@@ -533,10 +653,14 @@ class LauncherService:
                     f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
                 )
 
-        return self._create_task(f"补全 {version} 文件", job)
+        name = f"补全 {version} 文件"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, self._serialized_files(job))
 
     def delete_version(self, version_id: str) -> dict:
         """删除已安装版本目录（含隔离的 mods / 存档 / 配置），并清理相关设置。"""
+        if not version_id or Path(version_id).name != version_id:
+            raise RuntimeError(f"版本名不合法：{version_id}")
         for snapshot in self.tasks.list_snapshots(limit=50):
             if snapshot.get("status") in {TaskStatus.PENDING.value, TaskStatus.RUNNING.value} and (
                 version_id in snapshot.get("name", "")
@@ -582,12 +706,37 @@ class LauncherService:
         label = f"{loader} {loader_version}"
 
         def job(task: Task) -> None:
-            installer = LoaderInstaller(self.paths(), java=self.config.java)
+            paths = self.paths()
+            java = self.config.java
 
             def on_progress(stage: str, done: int, total: int) -> None:
                 task.emit({"type": "phase", "phase": stage, "done": done, "total": total})
 
             task.log(f"开始安装 {label}（基于 {game_version}）")
+            if game_version not in self.installed_versions():
+                # 原版还没装完整时先补全基础文件，否则安装完加载器也无法启动。
+                task.log(f"原版 {game_version} 尚未安装，先补全基础文件")
+                resolved = self.resolver().resolve(
+                    game_version,
+                    include_assets=True,
+                    progress=on_progress,
+                    cancel=task.check_cancel,
+                )
+                stats = Downloader(
+                    workers=self.config.download_workers, progress=task.emit
+                ).download(resolved.files, cancel=task.check_cancel)
+                if stats.failed:
+                    raise RuntimeError(
+                        f"原版文件下载失败，首个错误：{stats.failed[0][1]}"
+                    )
+                task.log(
+                    f"原版文件就绪：下载 {stats.files_downloaded} 个，"
+                    f"跳过 {stats.files_skipped} 个"
+                )
+            if loader in ("forge", "neoforge"):
+                # Forge / NeoForge 安装器需要用对应版本的 Java 运行。
+                java = self._loader_java(task, game_version)
+            installer = LoaderInstaller(paths, java=java)
             result = installer.install(
                 loader,
                 game_version,
@@ -596,6 +745,8 @@ class LauncherService:
                 log=task.log,
                 cancel=task.check_cancel,
             )
+            # 继承版本的客户端 jar / 库补齐，否则启动时 classpath 会缺文件。
+            self._install_version_files(task, result.version_id)
             task.result = {
                 "version_id": result.version_id,
                 "loader": result.loader,
@@ -604,7 +755,9 @@ class LauncherService:
             }
             task.log(f"加载器安装完成：{result.version_id}")
 
-        return self._create_task(f"安装 {label}", job)
+        name = f"安装 {label}（{game_version}）"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, self._serialized_files(job))
 
     # ------------------------------------------------------------------ Java
     def java_scan(self) -> list[dict]:
@@ -677,12 +830,13 @@ class LauncherService:
                 if now - counter["last"] >= 0.2:
                     counter["last"] = now
                     done = counter["bytes"]
+                    percent = min(100.0, done / total * 100) if total else 0.0
                     task.emit(
                         {
                             "type": "progress",
                             "bytes_done": done,
                             "bytes_total": total,
-                            "percent": round(done / total * 100, 2) if total else 0.0,
+                            "percent": round(percent, 2),
                             "current": f"下载 Java {major}",
                         }
                     )
@@ -711,7 +865,9 @@ class LauncherService:
             }
             task.log(f"Java {info.major} 安装完成：{info.path}")
 
-        return self.tasks.create(f"安装 Java {major}", job)
+        name = f"安装 Java {major}"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, job)
 
     # ------------------------------------------------------------------ 启动
     def launch(
@@ -742,6 +898,8 @@ class LauncherService:
 
         if self.has_running_game():
             raise RuntimeError("游戏正在运行，请先结束当前游戏再启动新实例")
+        if not dry_run and self._game_files_busy():
+            raise RuntimeError("游戏文件正在安装或补全，请等待任务完成后再启动")
 
         emit(1, "解析版本信息…")
         storage = bool(self.config.hash_store) and not dry_run
@@ -765,49 +923,61 @@ class LauncherService:
         isolated = bool(settings["isolated"])
         game_dir = paths.version_game_dir(version, isolated=isolated)
 
-        resolved = VersionResolver(paths).resolve(
-            version, include_assets=False, prefer_local=True, cancel=cancel
-        )
+        def cleanup_run_dir() -> None:
+            """启动准备失败时回收已物化的临时游戏目录，避免占用磁盘。"""
+            if run_dir is not None:
+                self.hash_store.clear(run_dir)
 
-        emit(4, "准备账号与启动参数…")
-        account, note, extra_jvm = self._resolve_account(
-            offline=offline,
-            username=username,
-            account_id=account_id,
-            game_dir=game_dir,
-        )
-        if note:
-            self.log(note)
+        try:
+            resolved = VersionResolver(paths).resolve(
+                version, include_assets=False, prefer_local=True, cancel=cancel
+            )
 
-        java = str(settings.get("java") or self.config.java)
-        if not dry_run:
-            java = self._ensure_java(resolved.java_major, java, progress=progress, cancel=cancel)
-            java = _prefer_javaw(java)  # Windows 下避免启动游戏时弹出黑色控制台窗口
-        # Java 就绪后用户仍可能点了取消，这里再检查一次，避免"取消了却还是启动了"。
-        if cancel and cancel():
-            raise DownloadCancelled("已取消启动")
-        emit(95, "构建启动参数…")
-        builder = LaunchBuilder(paths)
-        command = builder.build(
-            resolved,
-            account,
-            memory_mb=memory_mb or settings.get("memory_mb"),
-            min_memory_mb=settings.get("min_memory_mb"),
-            width=width or settings.get("width"),
-            height=height or settings.get("height"),
-            extra_jvm=[*extra_jvm, *(settings.get("extra_jvm") or [])],
-            extra_game=list(settings.get("extra_game") or []),
-            game_directory=game_dir,
-            java=java,
-        )
+            emit(4, "准备账号与启动参数…")
+            account, note, extra_jvm = self._resolve_account(
+                offline=offline,
+                username=username,
+                account_id=account_id,
+                game_dir=game_dir,
+            )
+            if note:
+                self.log(note)
 
-        if self.config.last_version != version or (
-            account_id and self.config.last_account != account_id
-        ):
-            self.config.last_version = version
-            if account_id:
-                self.config.last_account = account_id
-            self.store.save(self.config)
+            java = str(settings.get("java") or self.config.java)
+            if not dry_run:
+                java = self._ensure_java(resolved.java_major, java, progress=progress, cancel=cancel)
+                java = _prefer_javaw(java)  # Windows 下避免启动游戏时弹出黑色控制台窗口
+            # Java 就绪后用户仍可能点了取消，这里再检查一次，避免"取消了却还是启动了"。
+            if cancel and cancel():
+                raise DownloadCancelled("已取消启动")
+            emit(95, "构建启动参数…")
+            builder = LaunchBuilder(paths)
+            command = builder.build(
+                resolved,
+                account,
+                memory_mb=memory_mb or settings.get("memory_mb"),
+                min_memory_mb=settings.get("min_memory_mb"),
+                width=width or settings.get("width"),
+                height=height or settings.get("height"),
+                extra_jvm=[*extra_jvm, *(settings.get("extra_jvm") or [])],
+                extra_game=list(settings.get("extra_game") or []),
+                game_directory=game_dir,
+                java=java,
+            )
+
+            if self.config.last_version != version or (
+                account_id and self.config.last_account != account_id
+            ):
+                self.config.last_version = version
+                if account_id:
+                    self.config.last_account = account_id
+                self.store.save(self.config)
+        except DownloadCancelled:
+            cleanup_run_dir()
+            raise
+        except Exception:
+            cleanup_run_dir()
+            raise
 
         mode = "离线" if account.offline else "正版"
         self.log(f"启动 {version}（{account.username}，{mode}，隔离：{isolated}）")
@@ -985,6 +1155,13 @@ class LauncherService:
                 f"令牌刷新失败（{exc}），已回退为离线模式启动",
                 [],
             )
+        if fresh.expired:
+            # ensure_fresh 刷新失败时会原样返回旧令牌，过期令牌无法通过正版校验。
+            return (
+                Account.offline_account(username),
+                "微软登录令牌已过期且自动刷新失败，已回退为离线模式启动",
+                [],
+            )
         if account_id:
             self._accounts.set_tokens(account_id, fresh)
         return (
@@ -1114,29 +1291,38 @@ class LauncherService:
                 kind, version_id=version_id, isolated=self._is_isolated(version_id)
             )
             target_dir.mkdir(parents=True, exist_ok=True)
+            # 文件名来自第三方 API，取 basename 防止写出目标目录。
+            filename = Path(str(chosen.filename or "")).name
+            if not filename:
+                raise RuntimeError("下载源返回的文件名无效")
+            # 同名文件处于「已禁用」状态时先清掉，避免新旧两个文件同时出现在列表里。
+            (target_dir / f"{filename}.disabled").unlink(missing_ok=True)
             entry = FileEntry(
                 url=chosen.url,
-                target_path=target_dir / chosen.filename,
+                target_path=target_dir / filename,
                 sha1=chosen.sha1,
                 size=chosen.size,
                 kind=kind,
                 # CurseForge 的 CDN 下载必须带 Key。
                 headers=provider.download_headers() or None,
             )
-            stats = Downloader(workers=1, progress=task.emit).download(
-                [entry], cancel=task.check_cancel
-            )
+            # 单个 Mod / 资源包也可能很大，沿用全局并发数让文件内部分片也能并行下载。
+            stats = Downloader(
+                workers=self.config.download_workers, progress=task.emit
+            ).download([entry], cancel=task.check_cancel)
             if stats.failed:
                 raise RuntimeError(stats.failed[0][1])
             task.result = {
-                "filename": chosen.filename,
+                "filename": filename,
                 "path": str(entry.target_path),
                 "kind": kind,
                 "version": chosen.version,
                 "skipped": stats.files_skipped > 0,
             }
 
-        return self._create_task(f"安装 {kind} {label}", job)
+        name = f"安装 {kind} {label}" + (f" → {version_id}" if version_id else "")
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, job)
 
     def start_mod_install(
         self,
@@ -1208,6 +1394,7 @@ class LauncherService:
         *,
         version_id: Optional[str] = None,
         overwrite: bool = False,
+        filename: Optional[str] = None,
     ) -> dict:
         path = Path(source_path)
         if not path.exists():
@@ -1218,6 +1405,7 @@ class LauncherService:
             version_id=version_id,
             isolated=self._is_isolated(version_id),
             overwrite=overwrite,
+            filename=filename,
         )
         self.log(f"导入 {kind}：{target.name}")
         self._capture_storage()
@@ -1264,6 +1452,106 @@ class LauncherService:
             "override_count": info.override_count,
         }
 
+    def _install_version_files(self, task: Task, version_id: str) -> None:
+        """下载某个版本启动所需的 jar / libraries / 资源索引。
+
+        加载器版本继承了原版文件，Forge / NeoForge 安装器生成的目录通常没有
+        自己的客户端 jar；这里按版本解析结果补全，避免启动时 classpath 缺文件。
+        """
+        resolved = self.resolver().resolve(
+            version_id,
+            include_assets=False,
+            prefer_local=True,
+            cancel=task.check_cancel,
+        )
+        task.log(f"补全 {version_id} 的启动文件：{len(resolved.files)} 个")
+        stats = Downloader(
+            workers=self.config.download_workers, progress=task.emit
+        ).download(resolved.files, cancel=task.check_cancel)
+        if stats.failed:
+            raise RuntimeError(
+                f"{version_id} 文件下载失败，首个错误：{stats.failed[0][1]}"
+            )
+        task.log(
+            f"{version_id} 文件就绪：下载 {stats.files_downloaded} 个，"
+            f"跳过 {stats.files_skipped} 个"
+        )
+
+    def _prepare_modpack_version(self, task: Task, info, fallback: str = "") -> str:
+        """确保整合包所需原版文件与加载器就绪，返回整合包应装入的版本 ID。
+
+        整合包不能直接倒进一个空的版本目录：启动器安装时会清理没有版本
+        JSON 的目录，而且缺少加载器时游戏无法启动。这里先补全原版文件，
+        再按包内清单安装对应加载器，最后返回该加载器版本的目录名。
+        """
+        base = info.game_version or fallback
+        if not base:
+            raise RuntimeError("无法确定整合包的目标游戏版本")
+        loader = (
+            info.loader
+            if info.loader in SUPPORTED_LOADERS and info.loader_version
+            else ""
+        )
+        loader_version = info.loader_version if loader else ""
+        if info.loader and not loader:
+            task.log(f"加载器 {info.loader} 信息不完整或暂不支持，将按原版版本安装")
+        target = f"Minecraft {base}" + (
+            f" + {loader} {loader_version}" if loader else "（原版）"
+        )
+        task.log(f"整合包目标：{target}")
+
+        def on_phase(stage: str, done: int, total: int) -> None:
+            task.emit({"type": "phase", "phase": stage, "done": done, "total": total})
+
+        if base in self.installed_versions():
+            task.log(f"原版 {base} 已安装，跳过基础文件下载")
+        else:
+            resolved = self.resolver().resolve(
+                base,
+                include_assets=True,
+                progress=on_phase,
+                cancel=task.check_cancel,
+            )
+            task.log(f"校验原版文件：{len(resolved.files)} 个")
+            stats = Downloader(
+                workers=self.config.download_workers, progress=task.emit
+            ).download(resolved.files, cancel=task.check_cancel)
+            if stats.failed:
+                raise RuntimeError(
+                    f"原版文件下载失败，首个错误：{stats.failed[0][1]}"
+                )
+            task.log(
+                f"原版文件就绪：下载 {stats.files_downloaded} 个，"
+                f"跳过 {stats.files_skipped} 个"
+            )
+
+        if not loader:
+            return base
+
+        task.log(f"安装加载器 {loader} {loader_version}")
+        java = self.config.java
+        if loader in ("forge", "neoforge"):
+            java = self._loader_java(task, base)
+        loader_installer = LoaderInstaller(self.paths(), java=java)
+        result = loader_installer.install(
+            loader,
+            base,
+            loader_version,
+            progress=on_phase,
+            log=task.log,
+            cancel=task.check_cancel,
+        )
+        self._install_version_files(task, result.version_id)
+        task.log(f"加载器就绪：{result.version_id}")
+        return result.version_id
+
+    def _mark_modpack_isolated(self, version_id: str) -> None:
+        """整合包安装到版本目录，必须开启版本隔离才能被游戏读取。"""
+        if not version_id:
+            return
+        self.config.set_version_override(version_id, {"isolated": True})
+        self.store.save(self.config)
+
     def start_modpack_install(self, path: str, *, version_id: str) -> Task:
         archive = Path(path)
 
@@ -1273,22 +1561,27 @@ class LauncherService:
             def on_progress(stage: str, done: int, total: int) -> None:
                 task.emit({"type": "phase", "phase": stage, "done": done, "total": total})
 
+            info = installer.inspect(archive)
+            target = self._prepare_modpack_version(task, info, version_id)
+            self._mark_modpack_isolated(target)
             info = installer.install(
                 archive,
-                version_id=version_id,
+                version_id=target,
                 progress=on_progress,
                 log=task.log,
                 cancel=task.check_cancel,
             )
             task.result = {
-                "version_id": version_id,
+                "version_id": target,
                 "name": info.name,
                 "format": info.format,
                 "file_count": info.file_count,
             }
-            task.log(f"整合包导入完成：{info.name} → {version_id}")
+            task.log(f"整合包导入完成：{info.name} → {target}")
 
-        return self._create_task(f"导入整合包 {archive.name}", job)
+        name = f"导入整合包 {archive.name}"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, self._serialized_modpack(job))
 
     def export_modpack(
         self,
@@ -1308,6 +1601,7 @@ class LauncherService:
             game_version=_game_version_of(version_id),
             loader=_detect_loader(version_id),
             loader_version=_loader_version_of(version_id, _detect_loader(version_id)),
+            isolated=self._is_isolated(version_id),
         )
         self.log(f"整合包已导出：{result}")
         return {"path": str(result), "version_id": version_id, "isolated": settings["isolated"]}
@@ -1346,25 +1640,27 @@ class LauncherService:
 
             archive_dir = self.modpack_dir()
             archive_dir.mkdir(parents=True, exist_ok=True)
+            filename = Path(str(chosen.filename or "")).name
+            if not filename:
+                raise RuntimeError("下载源返回的文件名无效")
             entry = FileEntry(
                 url=chosen.url,
-                target_path=archive_dir / chosen.filename,
+                target_path=archive_dir / filename,
                 sha1=chosen.sha1,
                 size=chosen.size,
                 kind=CONTENT_MODPACK,
                 headers=provider.download_headers() or None,
             )
-            stats = Downloader(workers=1, progress=task.emit).download(
-                [entry], cancel=task.check_cancel
-            )
+            stats = Downloader(
+                workers=self.config.download_workers, progress=task.emit
+            ).download([entry], cancel=task.check_cancel)
             if stats.failed:
                 raise RuntimeError(stats.failed[0][1])
 
             installer = self._modpack()
             info = installer.inspect(entry.target_path)
-            target = version_id or info.game_version
-            if not target:
-                raise RuntimeError("无法确定整合包的目标游戏版本")
+            target = self._prepare_modpack_version(task, info, version_id or "")
+            self._mark_modpack_isolated(target)
 
             def on_progress(stage: str, done: int, total: int) -> None:
                 task.emit({"type": "phase", "phase": stage, "done": done, "total": total})
@@ -1377,7 +1673,7 @@ class LauncherService:
                 cancel=task.check_cancel,
             )
             task.result = {
-                "filename": chosen.filename,
+                "filename": filename,
                 "version_id": target,
                 "name": info.name,
                 "game_version": info.game_version,
@@ -1385,7 +1681,9 @@ class LauncherService:
             }
             task.log(f"整合包安装完成：{info.name} → {target}")
 
-        return self._create_task(f"安装整合包 {label}", job)
+        name = f"安装整合包 {label}"
+        existing = self._find_active_task(name)
+        return existing or self._create_task(name, self._serialized_modpack(job))
 
     # ------------------------------------------------------------- 崩溃分析
     def analyze_crash(self, version_id: Optional[str] = None) -> dict:
@@ -1475,7 +1773,7 @@ class LauncherService:
         stored = self.auth.load_tokens()
         if stored is None:
             raise AuthError("没有可刷新的登录状态")
-        result = self.auth.refresh_auth(stored.refresh_token)
+        self.auth.refresh_auth(stored.refresh_token)
         self.log("令牌已刷新")
         return {"status": "ok", "account": self.account_info()}
 
@@ -1580,6 +1878,10 @@ class LauncherService:
 
     # ------------------------------------------------------------------ 配置
     def update_config(self, changes: dict) -> dict:
+        # 先做跨字段校验再落配置，避免校验失败时把其它字段留在内存里造成状态不一致。
+        if "root" in changes and changes["root"] and self.config.hash_store:
+            raise RuntimeError("哈希存储开启时不能切换游戏目录，请先关闭哈希存储")
+
         allowed = {
             "java",
             "memory_mb",
@@ -1600,8 +1902,6 @@ class LauncherService:
                 setattr(self.config, key, value)
 
         if "root" in changes and changes["root"]:
-            if self.config.hash_store:
-                raise RuntimeError("哈希存储开启时不能切换游戏目录，请先关闭哈希存储")
             new_root = str(Path(str(changes["root"])).expanduser().resolve())
             self.config.root = new_root
             # 新游戏目录立即创建标准结构；账户清单固定在启动器数据目录，不随游戏目录移动。
@@ -1669,11 +1969,26 @@ def _detect_loader(version_id: str) -> str:
 
 
 def _game_version_of(version_id: str) -> str:
-    """从加载器版本目录名里猜出原版版本号，如 fabric-loader-0.15.0-1.20.1 → 1.20.1。"""
+    """从版本目录名里提取原版版本号。
+
+    - ``1.20.1`` / ``1.20.1-forge-47.2.0`` / ``fabric-loader-0.15.0-1.20.1``
+      都返回 ``1.20.1``；
+    - NeoForge 只写加载器版本（``neoforge-21.1.66``）时按编号规则推导为
+      ``1.21.1``，不再把加载器版本误当成游戏版本。
+    """
     import re
 
-    matches = re.findall(r"\d+\.\d+(?:\.\d+)?", version_id)
-    return matches[-1] if matches else version_id
+    text = version_id or ""
+    matches = re.findall(r"\d+\.\d+(?:\.\d+)?", text)
+    vanilla = [item for item in matches if item.startswith("1.")]
+    if vanilla:
+        return vanilla[0]
+    lowered = text.lower()
+    if "neoforge" in lowered and matches:
+        head = matches[0].split(".")
+        if len(head) >= 2:
+            return f"1.{head[0]}.{head[1]}"
+    return matches[0] if matches else text
 
 
 def _loader_version_of(version_id: str, loader: str) -> str:

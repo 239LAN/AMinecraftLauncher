@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -17,6 +19,8 @@ from .rules import detect_os_arch, detect_os_name, rules_allow
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 RESOURCES_URL = "https://resources.download.minecraft.net/"
 LIBRARIES_MIRROR = "https://libraries.minecraft.net/"
+# 版本清单缓存有效期：过期后重新拉取，避免新版本永远不出现；网络失败时仍用旧缓存。
+MANIFEST_TTL = 3600
 
 ProgressFn = Callable[[str, int, int], None]
 
@@ -53,16 +57,41 @@ class VersionResolver:
             return self._manifest
 
         cache = self.paths.versions_dir / "version_manifest_v2.json"
-        if cache.exists() and not force:
-            try:
-                self._manifest = json.loads(cache.read_text(encoding="utf-8"))
-                return self._manifest
-            except (OSError, json.JSONDecodeError):
-                pass
 
-        data = net.get_json(MANIFEST_URL)
+        def load_cache() -> Optional[dict[str, Any]]:
+            if not cache.exists():
+                return None
+            try:
+                return json.loads(cache.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+
+        if force:
+            pass
+        elif cache.exists():
+            try:
+                fresh = time.time() - cache.stat().st_mtime < MANIFEST_TTL
+            except OSError:
+                fresh = False
+            if fresh:
+                cached = load_cache()
+                if cached is not None:
+                    self._manifest = cached
+                    return cached
+
+        try:
+            data = net.get_json(MANIFEST_URL)
+        except Exception:
+            # 离线或官方清单不可达时退回本地缓存，至少还能列出已见过的版本。
+            cached = load_cache()
+            if cached is not None:
+                self._manifest = cached
+                return cached
+            raise
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(data), encoding="utf-8")
+        tmp = cache.with_name(cache.name + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, cache)
         self._manifest = data
         return data
 
@@ -165,7 +194,9 @@ class VersionResolver:
         target = self.paths.version_json(info.id)
         raw = net.fetch_bytes(info.url)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(raw)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_bytes(raw)
+        os.replace(tmp, target)
         return json.loads(raw.decode("utf-8"))
 
     # ------------------------------------------------------------------ parse
@@ -201,7 +232,7 @@ class VersionResolver:
 
         # 2) libraries（含原生库）
         libraries: list[LibraryInfo] = []
-        for raw_lib in version_json.get("libraries", []):
+        for raw_lib in version_json.get("libraries") or []:
             if not rules_allow(
                 raw_lib.get("rules"), self.os_name, self.os_arch, self.features
             ):
@@ -355,7 +386,7 @@ class VersionResolver:
             + f".{ext}"
         )
         return FileEntry(
-            url=LIBRARIES_MIRROR + relative,
+            url=_maven_base(name) + relative,
             target_path=self.paths.libraries_dir / relative,
             kind="library",
         )
@@ -419,6 +450,23 @@ class VersionResolver:
         return entries
 
 
+def _maven_base(name: str) -> str:
+    """按 Maven group 选择仓库根地址，避免把 Forge / Fabric 的库拼到 Mojang 仓库。
+
+    engine.mirror 已把这些地址都加入镜像规则，因此调用方无需关心镜像。
+    """
+    group = name.split(":", 1)[0].lower()
+    if group.startswith("net.minecraftforge"):
+        return "https://maven.minecraftforge.net/"
+    if group.startswith("net.neoforged"):
+        return "https://maven.neoforged.net/releases/"
+    if group.startswith(("net.fabricmc", "org.fabricmc")):
+        return "https://maven.fabricmc.net/"
+    if group.startswith("org.quiltmc"):
+        return "https://maven.quiltmc.org/"
+    return LIBRARIES_MIRROR
+
+
 def _lib_key(name: str) -> str:
     """库去重键：group:artifact:classifier（忽略版本，便于子版本覆盖）。"""
     raw = name.split("@", 1)[0]
@@ -447,6 +495,14 @@ def _merge(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = dict(parent)
     for key, value in child.items():
         if key in ("libraries", "arguments", "id"):
+            continue
+        if (
+            key == "downloads"
+            and isinstance(merged.get("downloads"), dict)
+            and isinstance(value, dict)
+        ):
+            # 加载器只补充自己的下载项时，不能把父版本的 client / server 丢掉。
+            merged["downloads"] = {**merged["downloads"], **value}
             continue
         merged[key] = value
 

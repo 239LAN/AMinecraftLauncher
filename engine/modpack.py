@@ -17,8 +17,9 @@ import json
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from . import net
@@ -45,6 +46,8 @@ _OVERRIDE_DIRS_CF = ("overrides",)
 # 统计 override 文件数时的路径前缀
 _OVERRIDE_PREFIXES_MRPACK = ("overrides/", "client-overrides/", "server-overrides/")
 _OVERRIDE_PREFIXES_CF = ("overrides/",)
+# 整合包文件并发下载数：整合包动辄几十上百个 Mod，顺序下载会非常慢。
+MAX_PARALLEL_DOWNLOADS = 8
 
 ProgressFn = Callable[[str, int, int], None]
 LogFn = Callable[[str], None]
@@ -211,29 +214,29 @@ class ModpackInstaller:
             for entry in (index.get("files", []) or [])
             if (entry.get("env") or {}).get("client") != "unsupported"
         ]
-        total = len(entries)
-        if progress:
-            progress("mods", 0, total)
-
-        for done, entry in enumerate(entries, start=1):
-            self._raise_if_cancelled(cancel)
-            relative = str(entry.get("path", "") or "")
+        items: list[tuple[str, Path, int, Optional[str], Optional[dict[str, str]]]] = []
+        for entry in entries:
+            relative = str(entry.get("path", "") or "").replace("\\", "/").strip()
             if not relative:
                 continue
+            # 清单里的路径来自整合包本身，必须拒绝绝对路径与 ../，避免写出游戏目录。
+            pure = PurePosixPath(relative)
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ModpackError(f"整合包条目包含非法路径：{relative}")
             downloads = entry.get("downloads", []) or []
             if not downloads:
                 raise ModpackError(f"整合包条目缺少下载地址：{relative}")
-
             hashes = entry.get("hashes", {}) or {}
-            self._download(
-                downloads[0],
-                game_dir / relative,
-                size=int(entry.get("fileSize") or 0),
-                sha1=hashes.get("sha1"),
-                cancel=cancel,
+            items.append(
+                (
+                    downloads[0],
+                    game_dir / relative,
+                    int(entry.get("fileSize") or 0),
+                    hashes.get("sha1"),
+                    None,
+                )
             )
-            if progress:
-                progress("mods", done, total)
+        self._download_items(items, progress, cancel)
 
     def _install_cf_files(
         self,
@@ -246,9 +249,6 @@ class ModpackInstaller:
             manifest = _read_json_member(zf, CF_MANIFEST)
 
         entries = manifest.get("files", []) or []
-        total = len(entries)
-        if progress:
-            progress("mods", 0, total)
 
         try:
             provider = build_provider("curseforge", timeout=self.timeout)
@@ -258,8 +258,9 @@ class ModpackInstaller:
         headers = provider.download_headers()
         mods_dir = game_dir / "mods"
         cache: dict[str, list] = {}
+        items: list[tuple[str, Path, int, Optional[str], Optional[dict[str, str]]]] = []
 
-        for done, entry in enumerate(entries, start=1):
+        for entry in entries:
             self._raise_if_cancelled(cancel)
             project_id = str(entry.get("projectID", "") or "")
             file_id = str(entry.get("fileID", "") or "")
@@ -274,18 +275,21 @@ class ModpackInstaller:
 
             match = next((item for item in files if item.file_id == file_id), None)
             if match is None:
+                # 文件列表默认分页，整合包引用的旧文件可能不在前几页，按 ID 直接查。
+                fetch_file = getattr(provider, "fetch_file", None)
+                if callable(fetch_file):
+                    match = fetch_file(project_id, file_id)
+            if match is None:
                 raise ModpackError(f"CurseForge 项目 {project_id} 未找到文件 {file_id}")
 
-            self._download(
-                match.url,
-                mods_dir / match.filename,
-                size=match.size,
-                sha1=match.sha1,
-                headers=headers,
-                cancel=cancel,
+            filename = Path(str(match.filename or "")).name
+            if not filename:
+                raise ModpackError(f"CurseForge 项目 {project_id} 的文件名无效")
+            items.append(
+                (match.url, mods_dir / filename, match.size, match.sha1, headers)
             )
-            if progress:
-                progress("mods", done, total)
+
+        self._download_items(items, progress, cancel)
 
     def _download(
         self,
@@ -310,6 +314,56 @@ class ModpackInstaller:
             Path(dest).unlink(missing_ok=True)
             raise ModpackError(f"文件校验失败：{Path(dest).name}")
 
+    def _download_items(
+        self,
+        items: list[tuple[str, Path, int, Optional[str], Optional[dict[str, str]]]],
+        progress: Optional[ProgressFn],
+        cancel: Optional[CancelFn],
+    ) -> None:
+        """并发下载整合包文件，按完成个数上报 ``mods`` 阶段进度。"""
+        # 同一目标路径可能在清单里出现多次，去重避免多个线程同时写一个文件。
+        unique: dict[str, tuple[str, Path, int, Optional[str], Optional[dict[str, str]]]] = {}
+        for item in items:
+            unique.setdefault(str(item[1]), item)
+        items = list(unique.values())
+        total = len(items)
+        if progress:
+            progress("mods", 0, total)
+        if not items:
+            return
+        done = 0
+        if total == 1:
+            url, dest, size, sha1, headers = items[0]
+            self._download(url, dest, size=size, sha1=sha1, headers=headers, cancel=cancel)
+            if progress:
+                progress("mods", 1, 1)
+            return
+
+        workers = min(MAX_PARALLEL_DOWNLOADS, total)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for url, dest, size, sha1, headers in items:
+                future = pool.submit(
+                    self._download,
+                    url,
+                    dest,
+                    size=size,
+                    sha1=sha1,
+                    headers=headers,
+                    cancel=cancel,
+                )
+                futures[future] = dest
+            try:
+                for future in as_completed(futures):
+                    future.result()
+                    done += 1
+                    if progress:
+                        progress("mods", done, total)
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+
     @staticmethod
     def _raise_if_cancelled(cancel: Optional[CancelFn]) -> None:
         if cancel and cancel():
@@ -326,15 +380,16 @@ class ModpackInstaller:
         game_version: str = "",
         loader: str = "",
         loader_version: str = "",
+        isolated: bool = True,
     ) -> Path:
         """把版本目录下启用状态的 mod 打包为 mrpack（overrides + 最小索引）。"""
         dest_zip = Path(dest_zip)
-        mods_dir = self.paths.mods_dir_for(version_id, isolated=True)
+        mods_dir = self.paths.mods_dir_for(version_id, isolated=isolated)
 
         dependencies: dict[str, str] = {}
         if game_version:
             dependencies["minecraft"] = game_version
-        if loader:
+        if loader and loader != "vanilla":
             dependencies[DEP_FROM_LOADER.get(loader, loader)] = loader_version
 
         index = {

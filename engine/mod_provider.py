@@ -1,5 +1,8 @@
 """ModProvider：Mod 检索与文件解析的抽象，实现 Modrinth 与 CurseForge。
 
+CurseForge 目前支持 Mod 与整合包的检索（classId 分别为 6 / 4471），
+其它类型（资源包 / 光影 / 数据包）请使用 Modrinth。
+
 CurseForge 改走 mcimirror 公共镜像，无需 API Key：
 
 - API：``api.curseforge.com/v1`` → ``mod.mcimirror.top/curseforge/v1``
@@ -25,6 +28,11 @@ CURSEFORGE_MIRROR = "https://mod.mcimirror.top"
 CURSEFORGE_CDN_HOST = "edge.forgecdn.net"
 CURSEFORGE_GAME_ID = 432  # Minecraft
 CURSEFORGE_MOD_CLASS = 6  # Mod
+# CurseForge 的 classId：目前只覆盖 Mod 与整合包，其余类型请走 Modrinth。
+CURSEFORGE_CLASS_IDS = {
+    "mod": CURSEFORGE_MOD_CLASS,
+    "modpack": 4471,
+}
 
 # Modrinth 项目类型 -> 网页路径段（默认回落到 mod）。
 MODRINTH_PAGE_SEGMENT = {
@@ -231,10 +239,13 @@ class CurseForgeProvider(ModProvider):
         loader: Optional[str] = None,
         project_type: str = "mod",
     ) -> list[ModSearchResult]:
-        # CurseForge 本实现只检索 mod（classId=6），project_type 接受但忽略。
+        kind = (project_type or "mod").lower()
+        class_id = CURSEFORGE_CLASS_IDS.get(kind)
+        if class_id is None:
+            raise ModProviderError("CurseForge 仅支持 Mod 与整合包检索，请改用 Modrinth")
         params = [
             f"gameId={CURSEFORGE_GAME_ID}",
-            f"classId={CURSEFORGE_MOD_CLASS}",
+            f"classId={class_id}",
             f"searchFilter={quote(query)}",
             f"index={offset}",
             f"pageSize={min(limit, 50)}",
@@ -293,26 +304,42 @@ class CurseForgeProvider(ModProvider):
 
         files: list[ModFile] = []
         for item in payload.get("data", []):
-            url = item.get("downloadUrl") or self._fetch_download_url(project_id, item.get("id"))
-            if not url:
-                continue
-            url = mirror_cdn_url(str(url))
-            hashes = {h.get("algo"): h.get("value") for h in item.get("hashes", [])}
-            files.append(
-                ModFile(
-                    source=self.name,
-                    project_id=project_id,
-                    file_id=str(item.get("id", "")),
-                    filename=item.get("fileName", ""),
-                    url=url,
-                    size=int(item.get("fileLength") or 0),
-                    sha1=hashes.get(1) or hashes.get("sha1"),  # algo=1 表示 SHA1
-                    version=item.get("displayName", ""),
-                    game_versions=item.get("gameVersions", []),
-                    dependencies=item.get("dependencies", []),
-                )
-            )
+            mod_file = self._file_from_item(project_id, item)
+            if mod_file is not None:
+                files.append(mod_file)
         return files
+
+    def fetch_file(self, project_id: str, file_id) -> Optional[ModFile]:
+        """按文件 ID 直接查询文件信息（整合包文件可能不在默认列表的前若干页）。"""
+        status, payload = net.get_json_auth(
+            f"{CURSEFORGE_API}/mods/{project_id}/files/{file_id}",
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        if status != 200:
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        return self._file_from_item(project_id, data)
+
+    def _file_from_item(self, project_id: str, item: dict) -> Optional[ModFile]:
+        url = item.get("downloadUrl") or self._fetch_download_url(project_id, item.get("id"))
+        if not url:
+            return None
+        hashes = {h.get("algo"): h.get("value") for h in item.get("hashes", [])}
+        return ModFile(
+            source=self.name,
+            project_id=project_id,
+            file_id=str(item.get("id", "")),
+            filename=item.get("fileName", ""),
+            url=mirror_cdn_url(str(url)),
+            size=int(item.get("fileLength") or 0),
+            sha1=hashes.get(1) or hashes.get("sha1"),  # algo=1 表示 SHA1
+            version=item.get("displayName", ""),
+            game_versions=item.get("gameVersions", []),
+            dependencies=item.get("dependencies", []),
+        )
 
     def _fetch_download_url(self, project_id: str, file_id) -> Optional[str]:
         """作者关闭 API 分发时 downloadUrl 为 null，需单独换取。"""

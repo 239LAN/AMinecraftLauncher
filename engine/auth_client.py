@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from . import net
@@ -209,6 +209,9 @@ class AuthClient:
         if error == "authorization_pending":
             return None
         if error == "slow_down":
+            # 服务端要求降低轮询频率，后续等待按更长间隔执行。
+            if self._last_device_code is not None:
+                self._last_device_code.interval += 5
             return None
         if error in ("expired_token", "code_expired"):
             raise AuthError("设备码已过期，请重新获取。", code=error)

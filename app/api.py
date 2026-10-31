@@ -77,6 +77,7 @@ class ContentImportRequest(BaseModel):
     path: str
     version_id: Optional[str] = None
     overwrite: bool = False
+    filename: Optional[str] = None
 
 
 class ContentInstallRequest(BaseModel):
@@ -379,6 +380,7 @@ def register_api(service: LauncherService) -> None:
             request.path,
             version_id=request.version_id,
             overwrite=request.overwrite,
+            filename=request.filename,
         )
 
     @app.post("/api/content/install")

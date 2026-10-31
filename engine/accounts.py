@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import uuid as _uuid
 from dataclasses import dataclass
@@ -132,15 +133,15 @@ class AccountStore:
         return list(self._accounts)
 
     def save(self) -> None:
-        """把账户清单写回 JSON（原子性由调用方按需保证）。"""
+        """把账户清单原子写回 JSON（临时文件 + os.replace）。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "active": self._active_id,
             "accounts": [account.as_dict() for account in self._accounts],
         }
-        self.path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
 
     # ------------------------------------------------------------------ 增删查
     def add(self, account: StoredAccount) -> StoredAccount:

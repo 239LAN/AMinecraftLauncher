@@ -60,7 +60,9 @@ class Task:
         with self._cond:
             self._seq += 1
             self._events.append((self._seq, event))
-            if event.get("type") == "progress":
+            # 阶段事件（phase）也要成为「最近进度」，否则任务进入加载器 / 整合包
+            # 阶段后，界面会一直停在上一个下载阶段的 100%。
+            if event.get("type") in ("progress", "phase"):
                 self._last_progress = event
             self._cond.notify_all()
 
@@ -72,7 +74,12 @@ class Task:
 
     @property
     def percent(self) -> float:
-        return float(self._last_progress.get("percent") or 0.0)
+        progress = self._last_progress
+        if progress.get("type") == "phase" and progress.get("total"):
+            done = float(progress.get("done") or 0.0)
+            total = float(progress.get("total") or 0.0)
+            return min(100.0, max(0.0, done / total * 100)) if total else 0.0
+        return float(progress.get("percent") or 0.0)
 
     def check_cancel(self) -> bool:
         """传给 Downloader 的 cancel 回调。"""
@@ -180,12 +187,20 @@ class TaskManager:
             task.log("已取消")
             self.log(f"已取消：{task.name}")
         except Exception as exc:  # noqa: BLE001 - 任务失败只记录，不拖垮进程
-            task.status = TaskStatus.FAILED
-            task.error = str(exc)
-            task.log(f"失败：{exc}")
-            for line in traceback.format_exc().splitlines()[-6:]:
-                task.log(line)
-            self.log(f"失败：{task.name} - {exc}")
+            if task.cancelled:
+                # 用户已点取消，各引擎抛出的是业务异常（LoaderError / ModpackError 等），
+                # 统一按「已取消」收尾，避免界面显示成失败并弹出一堆堆栈。
+                task.status = TaskStatus.CANCELLED
+                task.error = ""
+                task.log("已取消")
+                self.log(f"已取消：{task.name}")
+            else:
+                task.status = TaskStatus.FAILED
+                task.error = str(exc)
+                task.log(f"失败：{exc}")
+                for line in traceback.format_exc().splitlines()[-6:]:
+                    task.log(line)
+                self.log(f"失败：{task.name} - {exc}")
         else:
             if task.cancelled:
                 task.status = TaskStatus.CANCELLED

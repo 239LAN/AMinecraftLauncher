@@ -32,6 +32,23 @@ NAV_ITEMS = [
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
     {
+        "version": "1.2.0",
+        "title": "全量修复 · 体验优化",
+        "notes": """\
+- 修复桌面模式关闭按钮无效，关闭时可靠退出并保存存档
+- 修复下载进度超过 100%：断点续传 / 分片回退时不再重复计数
+- 大文件与未下载部分统一进入分片任务池，持续保持高并发，取消后可续传
+- 镜像与官方源都可用时双源并行下载，单个源失败自动换源
+- 整合包安装重做：自动补全原版、按包内清单安装加载器、补全加载器文件并开启版本隔离
+- 整合包 Mod 改为并发下载，CurseForge 旧文件可直接按 ID 查询
+- 导入 Mod / 整合包保留原始文件名，大文件改为流式落盘
+- 修复 Forge / NeoForge 游戏版本识别错误，Mod 筛选更准确
+- 游戏文件安装任务串行排队，安装期间启动会给出提示；排队任务可随时取消
+- 优化任务阶段展示、加载器列表 / 崩溃诊断后台执行、Java 探测与安装流程
+- 配置文件、账户清单、版本 JSON 改为原子写入；哈希库流式压缩并忽略分片文件
+""",
+    },
+    {
         "version": "1.1.1",
         "title": "存储修复 · 压缩",
         "notes": """\
@@ -102,7 +119,31 @@ CONTENT_LABELS = {
     "modpack": "整合包",
 }
 
+# 引擎阶段名 -> 界面中文文案（任务详情 / 进度展示用）。
+PHASE_LABELS = {
+    "assets": "解析资源文件",
+    "profile": "获取版本配置",
+    "java": "准备 Java",
+    "download": "下载安装器",
+    "install": "运行安装器",
+    "mods": "下载整合包文件",
+    "storage": "迁移文件库",
+    "hashsync": "同步哈希库",
+    "wait": "等待其它整合包任务",
+    "waitfiles": "等待其它文件安装任务",
+}
+
+SEVERITY_LABELS = {"high": "严重", "medium": "中等", "low": "提示"}
+
 LOADERS = ["fabric", "forge", "neoforge", "quilt"]
+LOADER_LABELS = {
+    "vanilla": "原版",
+    "fabric": "Fabric",
+    "forge": "Forge",
+    "neoforge": "NeoForge",
+    "quilt": "Quilt",
+    "optifine": "OptiFine",
+}
 
 AML_CSS = """
 :root {
@@ -641,9 +682,9 @@ class LauncherUI:
                 ).classes("aml-topnav")
                 self.nav_buttons[key] = button
 
-            # 关闭按钮始终可用：原生模式销毁窗口，Web 模式尝试关闭标签页。
+            # 关闭按钮始终可用：原生模式退出桌面程序，Web 模式尝试关闭标签页。
             with ui.row().classes("items-center gap-0 no-wrap shrink-0 pl-2"):
-                if app.native.main_window is not None:
+                if self._native_window() is not None:
                     ui.button(icon="remove", on_click=self._win_minimize).props(
                         "flat dense round size=sm"
                     )
@@ -655,7 +696,10 @@ class LauncherUI:
                 ).classes("aml-close-btn")
 
     def _native_window(self):
-        return app.native.main_window
+        try:
+            return app.native.main_window
+        except Exception:  # noqa: BLE001 - 非原生模式或窗口尚未创建
+            return None
 
     def _win_minimize(self) -> None:
         window = self._native_window()
@@ -687,11 +731,22 @@ class LauncherUI:
         self._close_window()
 
     def _close_window(self) -> None:
-        # 原生窗口直接销毁；Web 模式退化为尝试关闭浏览器标签。
-        ui.run_javascript("window.close()")
         window = self._native_window()
-        if window is not None:
-            window.destroy()
+        if window is None:
+            # Web 模式退化为尝试关闭浏览器标签（浏览器可能拦截非脚本打开的窗口）。
+            ui.run_javascript("window.close()")
+            return
+        # 桌面模式：window.close() 在 WebView2 中通常无效，而且一旦它抛错，
+        # 后面的逻辑就不会执行，窗口反而关不掉。这里用 NiceGUI 的 shutdown：
+        # 它会销毁原生窗口并停止服务端，窗口子进程随父进程退出而结束。
+        try:
+            app.shutdown()
+        except Exception as exc:  # noqa: BLE001 - shutdown 失败时兜底直接销毁窗口
+            self.service.log(f"关闭窗口失败，尝试直接销毁：{exc}")
+            try:
+                window.destroy()
+            except Exception as inner:  # noqa: BLE001
+                self.service.log(f"销毁窗口失败：{inner}")
 
     def _confirm_close_with_game(self) -> None:
         info = self.service.running_game_info()
@@ -934,6 +989,9 @@ class LauncherUI:
                     self.home_launch = ui.button(
                         "启动游戏", icon="play_circle", on_click=self._on_home_launch_click
                     ).classes("aml-launch w-full h-[50px] text-[15px]").props("unelevated no-caps")
+                    ui.label("可将 Mod（.jar）或整合包（.mrpack / .zip）拖到本页导入").classes(
+                        "aml-sub text-center"
+                    ).style("line-height: 1.5")
 
             # 启动页拖入的 Mod / 整合包由这个隐藏控件接收。
             ui.upload(
@@ -964,6 +1022,14 @@ class LauncherUI:
             )
 
     def _render_home_identity(self) -> None:
+        # 刷新登录区时保留用户已经输入但还没提交的用户名。
+        draft = ""
+        name_input = getattr(self, "home_name", None)
+        if name_input is not None:
+            try:
+                draft = str(name_input.value or "")
+            except Exception:  # noqa: BLE001 - 元素已被清理时忽略
+                draft = ""
         self.home_identity.clear()
         if self._home_launching:
             with self.home_identity:
@@ -986,9 +1052,9 @@ class LauncherUI:
                         "flat dense no-caps"
                     ).classes("aml-sub")
             else:
-                self.home_name = ui.input(placeholder="输入用户名").classes(
-                    "w-[220px]"
-                ).props("dense outlined")
+                self.home_name = ui.input(
+                    placeholder="输入用户名", value=draft
+                ).classes("w-[220px]").props("dense outlined")
                 self.home_name.on(
                     "keydown.enter", lambda: background_tasks.create(self._home_login())
                 )
@@ -999,7 +1065,8 @@ class LauncherUI:
 
     def _render_avatar(self, account: Optional[dict]) -> None:
         url = ""
-        if account:
+        # 离线账号的 UUID 不在 Mojang / crafatar 上，请求头像只会得到破损图片。
+        if account and account.get("kind") != "offline":
             try:
                 url = self.service.account_skin(account["id"]).get("avatar") or ""
             except Exception:  # noqa: BLE001 - 皮肤服务不可用时用占位头像
@@ -1124,6 +1191,16 @@ class LauncherUI:
     MOD_SUFFIXES = {".jar"}
     PACK_SUFFIXES = {".mrpack", ".zip"}
 
+    @staticmethod
+    async def _save_upload(file, path: Path) -> None:
+        """优先使用上传对象的流式保存接口，兼容旧版 NiceGUI 回退到 read()。"""
+        save = getattr(file, "save", None)
+        if callable(save):
+            await save(path)
+            return
+        data = await file.read()
+        await run.io_bound(path.write_bytes, data)
+
     async def _handle_home_files(self, event) -> None:
         """启动页拖入：按扩展名自动识别 Mod / 整合包，解析后弹窗确认。"""
         files = list(getattr(event, "files", []) or [])
@@ -1132,18 +1209,24 @@ class LauncherUI:
         version = self.home_version.value or self.service.config.last_version
         items: list[dict] = []
         errors: list[str] = []
+        ui.notify(f"正在读取 {len(files)} 个文件…", position="top-right")
 
         for file in files:
             filename = Path(file.name).name
             suffix = Path(filename).suffix.lower()
-            data = await file.read()
             if suffix in self.MOD_SUFFIXES:
                 if not version:
                     errors.append(f"{filename}：请先选择启动版本")
                     continue
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".jar") as handle:
-                    handle.write(data)
                     temp_path = Path(handle.name)
+                try:
+                    # 流式落盘，避免大文件整体读进内存。
+                    await self._save_upload(file, temp_path)
+                except Exception as exc:  # noqa: BLE001
+                    temp_path.unlink(missing_ok=True)
+                    errors.append(f"{filename}：{exc}")
+                    continue
                 items.append(
                     {"kind": "mod", "name": filename, "path": temp_path, "target": version}
                 )
@@ -1151,7 +1234,11 @@ class LauncherUI:
                 target_dir = self.service.modpack_dir()
                 target_dir.mkdir(parents=True, exist_ok=True)
                 target = target_dir / filename
-                target.write_bytes(data)
+                try:
+                    await self._save_upload(file, target)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{filename}：{exc}")
+                    continue
                 try:
                     info = await run.io_bound(self.service.inspect_modpack, str(target))
                 except Exception as exc:  # noqa: BLE001
@@ -1220,6 +1307,7 @@ class LauncherUI:
                     await run.io_bound(
                         self.service.content_import, "mod", str(item["path"]),
                         version_id=item["target"], overwrite=True,
+                        filename=item["name"],
                     )
                     added += 1
                 except Exception as exc:  # noqa: BLE001
@@ -1240,7 +1328,10 @@ class LauncherUI:
             ui.notify(f"已开始安装 {packs} 个整合包，进度见「任务」页", position="top-right")
         if errors:
             ui.notify("；".join(errors[:3]), type="negative", position="top-right")
+        self._download_stale = True
         self._refresh_home()
+        if self.current_view == "versions":
+            self._reload_version_list()
 
     # ==================================================================== 版本
     def _build_versions_page(self) -> None:
@@ -1288,7 +1379,9 @@ class LauncherUI:
                 ) as row:
                     ui.label(version["id"]).classes("text-[13px] font-medium")
                     with ui.row().classes("items-center gap-1 no-wrap"):
-                        ui.label(version["loader"]).classes("aml-chip primary")
+                        ui.label(LOADER_LABELS.get(version["loader"], version["loader"])).classes(
+                            "aml-chip primary"
+                        )
                         if version.get("isolated"):
                             ui.label("隔离").classes("aml-chip")
                 row.on("click", lambda _=None, vid=version["id"]: self._select_version(vid))
@@ -1322,7 +1415,9 @@ class LauncherUI:
                     with ui.column().classes("gap-0.5 min-w-0"):
                         ui.label(version_id).classes("text-[17px] font-semibold")
                         with ui.row().classes("items-center gap-1 no-wrap"):
-                            ui.label(profile["loader"]).classes("aml-chip primary")
+                            ui.label(
+                                LOADER_LABELS.get(profile["loader"], profile["loader"])
+                            ).classes("aml-chip primary")
                             ui.label(profile.get("game_version") or "").classes("aml-chip")
                 with ui.row().classes("gap-2 no-wrap shrink-0"):
                     ui.button(
@@ -1494,14 +1589,13 @@ class LauncherUI:
                 errors.append(f"{filename} 不是 .jar")
                 continue
             drop.busy(f"正在导入 {done}/{total}：{filename}", percent=(done - 1) / total * 100)
-            data = await file.read()
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jar") as handle:
-                handle.write(data)
                 temp_path = Path(handle.name)
             try:
+                await self._save_upload(file, temp_path)
                 await run.io_bound(
                     self.service.content_import, "mod", str(temp_path),
-                    version_id=version_id, overwrite=True,
+                    version_id=version_id, overwrite=True, filename=filename,
                 )
                 added += 1
             except Exception as exc:  # noqa: BLE001 - 单个失败不影响其它文件
@@ -1618,9 +1712,11 @@ class LauncherUI:
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
             ui.label("安装模组加载器").classes("text-[14px] font-semibold")
             with ui.row().classes("w-full items-end gap-3 no-wrap"):
-                loader = ui.select(LOADERS, value="fabric", label="加载器").classes(
-                    "w-[130px]"
-                ).props("dense outlined")
+                loader = ui.select(
+                    {key: LOADER_LABELS[key] for key in LOADERS},
+                    value="fabric",
+                    label="加载器",
+                ).classes("w-[130px]").props("dense outlined")
                 game_version = ui.input(label="原版版本", value=base_version).classes(
                     "w-[140px]"
                 ).props("dense outlined")
@@ -1628,10 +1724,15 @@ class LauncherUI:
                     "flex-1"
                 ).props("dense outlined")
 
-            def fetch_loader_versions() -> None:
+            async def fetch_loader_versions() -> None:
+                target = (game_version.value or "").strip()
+                if not target:
+                    ui.notify("请先填写原版版本", type="warning", position="top-right")
+                    return
                 try:
-                    items = self.service.loader_versions(
-                        loader.value, (game_version.value or "").strip()
+                    # 联网请求放到后台线程，避免拉取列表时界面卡住。
+                    items = await run.io_bound(
+                        self.service.loader_versions, loader.value, target
                     )
                 except Exception as exc:  # noqa: BLE001
                     ui.notify(f"获取加载器版本失败：{exc}", type="negative", position="top-right")
@@ -1669,12 +1770,13 @@ class LauncherUI:
                 ).props("flat dense no-caps")
             crash_box = ui.column().classes("w-full gap-2")
 
-        def run_crash() -> None:
+        async def run_crash() -> None:
             crash_box.clear()
             with crash_box:
                 ui.spinner(size="sm").style("color: var(--aml-accent)")
             try:
-                report = self.service.analyze_crash(version_id)
+                # 读取崩溃报告 / latest.log 可能较大，放到后台线程避免界面卡顿。
+                report = await run.io_bound(self.service.analyze_crash, version_id)
             except Exception as exc:  # noqa: BLE001
                 crash_box.clear()
                 with crash_box:
@@ -1696,10 +1798,14 @@ class LauncherUI:
             ):
                 with ui.row().classes("items-center gap-2 no-wrap"):
                     ui.label(cause.get("title") or cause.get("code")).classes("text-[13px] font-medium")
-                    ui.label(severity).classes("aml-chip warn" if severity != "low" else "aml-chip")
+                    ui.label(SEVERITY_LABELS.get(severity, severity)).classes(
+                        "aml-chip warn" if severity != "low" else "aml-chip"
+                    )
                 ui.label(cause.get("suggestion") or "").classes("aml-sub")
                 if cause.get("evidence"):
-                    ui.label(cause["evidence"]).classes("aml-sub").style(
+                    evidence = cause["evidence"]
+                    text = "\n".join(evidence) if isinstance(evidence, list) else str(evidence)
+                    ui.label(text).classes("aml-sub").style(
                         "font-family: monospace; white-space: pre-wrap;"
                     )
         if report.get("sources"):
@@ -1892,12 +1998,27 @@ class LauncherUI:
             ui.label("请先安装并在上方选择本地游戏版本").classes("aml-sub p-2")
             return
         profile = self.service.version_profile(version_id)
-        loader = profile["loader"] if profile["loader"] != "vanilla" else None
+        # OptiFine 不是模组加载器，按没加载器处理，避免向 Modrinth 传不存在的分类。
+        loader = (
+            profile["loader"]
+            if profile["loader"] not in ("vanilla", "optifine")
+            else None
+        )
 
+        # CurseForge 只支持 Mod 与整合包检索，其它类型只提供 Modrinth。
+        source_options = {"modrinth": "Modrinth"}
+        if kind == "mod":
+            source_options["curseforge"] = "CurseForge"
+        default_source = (
+            self.service.config.mod_source
+            if self.service.config.mod_source in source_options
+            else "modrinth"
+        )
         with ui.row().classes("aml-card flat w-full items-center gap-3 p-3 no-wrap"):
             self.content_source = ui.select(
-                {"modrinth": "Modrinth", "curseforge": "CurseForge"},
-                value=self.service.config.mod_source, label="来源",
+                source_options,
+                value=default_source,
+                label="来源",
             ).classes("w-[130px]").props("dense outlined")
             self.content_query = ui.input(placeholder="搜索关键词").classes("flex-1").props(
                 "dense outlined"
@@ -1915,8 +2036,12 @@ class LauncherUI:
 
         ui.label(
             f"已按 {version_id} 自动筛选：游戏版本 {profile.get('game_version')}"
-            + (f" · 加载器 {loader}" if loader else " · 原版")
+            + (f" · 加载器 {LOADER_LABELS.get(loader, loader)}" if loader else " · 原版")
         ).classes("aml-sub")
+        if kind == "mod" and loader is None:
+            ui.label(
+                "当前版本未安装模组加载器，下载的 Mod 需要先在「版本 → 版本设置」中安装 Fabric / Forge 等加载器才能生效"
+            ).classes("aml-sub").style("color: #b45309")
 
         self.content_results = ui.column().classes("w-full gap-2")
         with self.content_results:
@@ -2093,11 +2218,17 @@ class LauncherUI:
         if Path(filename).suffix.lower() not in {".mrpack", ".zip"}:
             ui.notify("只支持 .mrpack / .zip 整合包", type="warning", position="top-right")
             return
-        data = await file.read()
         target_dir = self.service.modpack_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / filename
-        target.write_bytes(data)
+        # 整合包可能有几百 MB，直接用上传对象流式落盘。
+        drop.busy(f"正在保存 {filename}…")
+        try:
+            await self._save_upload(file, target)
+        except Exception as exc:  # noqa: BLE001 - 磁盘写入失败
+            drop.idle()
+            ui.notify(f"保存整合包失败：{exc}", type="negative", position="top-right")
+            return
 
         drop.busy(f"正在检查 {filename}…")
         try:
@@ -2120,7 +2251,10 @@ class LauncherUI:
         task = self.service.start_modpack_install(str(target), version_id=version_id)
         status, error = await self._await_import_task(task, drop, label)
         drop.idle()
+        self._download_stale = True
         self._refresh_home()
+        if self.current_view == "versions":
+            self._reload_version_list()
         if status == "done":
             ui.notify(f"整合包已导入：{label}", type="positive", position="top-right")
         elif error:
@@ -2135,12 +2269,25 @@ class LauncherUI:
             if snapshot is None:
                 return "failed", "任务已结束"
             status = str(snapshot.get("status") or "running")
-            percent = float(snapshot.get("percent") or 0.0)
             if status not in {"done", "failed", "cancelled"}:
-                drop.busy(
-                    f"正在导入 {label}" + (f" · {percent:.0f}%" if percent > 0 else ""),
-                    percent=percent if percent > 0 else None,
-                )
+                progress = snapshot.get("progress") or {}
+                if progress.get("type") == "phase":
+                    phase = str(progress.get("phase") or "")
+                    text = PHASE_LABELS.get(phase, phase or "处理中")
+                    done = int(progress.get("done", 0) or 0)
+                    total = int(progress.get("total", 0) or 0)
+                    if total:
+                        text += f" {done}/{total}"
+                    drop.busy(
+                        f"正在导入 {label} · {text}",
+                        percent=(done / total * 100) if total else None,
+                    )
+                else:
+                    percent = self._task_percent(snapshot)
+                    drop.busy(
+                        f"正在导入 {label}" + (f" · {percent:.0f}%" if percent > 0 else ""),
+                        percent=percent if percent > 0 else None,
+                    )
                 await asyncio.sleep(0.4)
                 continue
             return status, str(snapshot.get("error") or "")
@@ -2278,10 +2425,11 @@ class LauncherUI:
         progress = snapshot.get("progress") or {}
         percent = float(snapshot.get("percent") or 0.0)
         if progress.get("type") == "phase" and progress.get("total"):
-            percent = min(100.0, progress.get("done", 0) / progress["total"] * 100)
+            percent = progress.get("done", 0) / progress["total"] * 100
         if snapshot["status"] == "done":
             percent = 100.0
-        return percent
+        # 进度统一收敛到 0~100：分片回退、未知大小文件等都不应显示超过 100%。
+        return min(100.0, max(0.0, percent))
 
     def _render_task_overview(self, snapshots: list[dict]) -> None:
         self.task_overview.clear()
@@ -2296,7 +2444,7 @@ class LauncherUI:
             total_bytes += int(progress.get("bytes_total") or 0)
 
         if running and total_bytes > 0:
-            percent = min(100.0, done_bytes / total_bytes * 100)
+            percent = done_bytes / total_bytes * 100
         elif running:
             percent = sum(float(s.get("percent") or 0) for s in running) / len(running)
         else:
@@ -2304,6 +2452,7 @@ class LauncherUI:
                 100.0 if s["status"] == "done" else float(s.get("percent") or 0)
                 for s in snapshots
             ) / len(snapshots)
+        percent = min(100.0, max(0.0, percent))
 
         speed = self._total_speed(snapshots)
         with self.task_overview:
@@ -2416,11 +2565,22 @@ class LauncherUI:
                 return f"下载 {downloaded} 个，跳过 {result.get('skipped', 0)} 个"
             if result.get("name"):
                 return f"已完成 {result['name']}"
+            if result.get("version_id") and result.get("loader"):
+                return f"已安装 {result['loader']} → {result['version_id']}"
+            if result.get("major") and result.get("path"):
+                return f"Java {result['major']} 已就绪：{result['path']}"
             if result.get("path"):
                 return str(result["path"])
             return "已完成"
         if progress.get("type") == "phase":
-            return f"{progress.get('phase', '处理中')} {progress.get('done', 0)}/{progress.get('total', 0)}"
+            phase = str(progress.get("phase") or "处理中")
+            label = PHASE_LABELS.get(phase, phase)
+            done = int(progress.get("done", 0) or 0)
+            total = int(progress.get("total", 0) or 0)
+            if total:
+                return f"{label} {done}/{total}"
+            # 下载安装器等阶段总大小未知，展示已下载的大小而不是「0/0」。
+            return f"{label} {_fmt_size(done)}" if done else label
         done = progress.get("files_done", 0)
         total = progress.get("files_total", 0)
         current = progress.get("current") or ""
@@ -2490,7 +2650,7 @@ class LauncherUI:
             ui.label("游戏文件（版本 / libraries / assets / mods）统一放在该目录，修改后立即生效").classes("aml-sub")
             with ui.row().classes("w-full items-center gap-3 no-wrap"):
                 self.set_mirror = ui.switch(
-                    "BMCLAPI 镜像加速（镜像优先，失败自动回退官方）",
+                    "BMCLAPI 镜像加速（镜像与官方可用时双源并行，失败自动回退）",
                     value=view["download_source"] != "official",
                 ).props("dense")
                 ui.space()
@@ -2510,7 +2670,9 @@ class LauncherUI:
                     value=view["mod_source"], label="默认 Mod 来源",
                 ).classes("flex-1").props("dense outlined")
                 self.set_mod_loader = ui.select(
-                    LOADERS, value=view["mod_loader"], label="默认加载器"
+                    {key: LOADER_LABELS[key] for key in LOADERS},
+                    value=view["mod_loader"] if view["mod_loader"] in LOADERS else "fabric",
+                    label="默认加载器",
                 ).classes("flex-1").props("dense outlined")
             self.set_include_snapshots = ui.switch(
                 "版本列表包含快照", value=bool(view["include_snapshots"])
@@ -2576,13 +2738,17 @@ class LauncherUI:
         ).classes("self-start")
 
     async def _save_launcher_settings(self) -> None:
+        client_id = (self.set_client_id.value or "").strip()
+        if not client_id:
+            ui.notify("微软客户端 ID 不能为空", type="warning", position="top-right")
+            return
         changes = {
             "download_source": "auto" if self.set_mirror.value else "official",
             "download_workers": int(self.set_workers.value or 32),
             "mod_source": self.set_mod_source.value,
             "mod_loader": self.set_mod_loader.value,
             "include_snapshots": bool(self.set_include_snapshots.value),
-            "client_id": self.set_client_id.value,
+            "client_id": client_id,
         }
         try:
             view = await run.io_bound(self.service.update_config, changes)
@@ -2592,6 +2758,10 @@ class LauncherUI:
         self.mirror_hint.text = (
             f"当前下载源：{view['mirror'].get('active') or view['mirror'].get('source')}"
         )
+        # 下载页有同名快照开关，保持同步，避免显示过期状态。
+        if hasattr(self, "snapshot_switch"):
+            self.snapshot_switch.value = bool(self.service.config.include_snapshots)
+            self.snapshot_switch.update()
         ui.notify("启动器设置已保存", type="positive", position="top-right")
 
     def _storage_text(self, storage: dict) -> str:

@@ -87,6 +87,14 @@ class ContentError(Exception):
     """内容管理相关错误（未知类型、文件不存在、目标已存在等）。"""
 
 
+def _require_name(name: str, label: str = "名称") -> str:
+    """校验用户提供的文件名 / 目录名，禁止 ../ 与路径分隔符。"""
+    text = str(name or "")
+    if not text or Path(text).name != text:
+        raise ContentError(f"{label}不合法：{name}")
+    return text
+
+
 def _stat_meta(path: Path) -> tuple[int, float]:
     """读取文件大小与修改时间，文件缺失时返回 (0, 0.0)。"""
     try:
@@ -179,6 +187,7 @@ class ContentManager:
         isolated: bool = False,
     ) -> LocalContent:
         """启用 / 禁用内容文件（重命名在 ``foo.jar`` 与 ``foo.jar.disabled`` 间切换）。"""
+        filename = _require_name(filename, "内容文件名")
         directory = self.dir_for(kind, version_id=version_id, isolated=isolated)
         active = directory / filename
         disabled = directory / f"{filename}{_DISABLED_SUFFIX}"
@@ -215,6 +224,7 @@ class ContentManager:
         isolated: bool = False,
     ) -> None:
         """删除内容文件（无论当前是启用还是禁用状态）。"""
+        filename = _require_name(filename, "内容文件名")
         directory = self.dir_for(kind, version_id=version_id, isolated=isolated)
         targets = (directory / filename, directory / f"{filename}{_DISABLED_SUFFIX}")
         removed = False
@@ -233,17 +243,26 @@ class ContentManager:
         version_id: Optional[str] = None,
         isolated: bool = False,
         overwrite: bool = False,
+        filename: Optional[str] = None,
     ) -> Path:
-        """把 ``source`` 复制到目标目录，文件名沿用 ``source.name``，返回目标路径。"""
+        """把 ``source`` 复制到目标目录并保留原始文件名，返回目标路径。
+
+        ``filename`` 用于上传流程：临时文件的名字是随机的，必须用上传时的原名。
+        """
         source = Path(source)
         if not source.is_file():
             raise ContentError(f"源文件不存在：{source}")
 
+        name = _require_name(filename or source.name, "文件名")
         directory = self.dir_for(kind, version_id=version_id, isolated=isolated)
         directory.mkdir(parents=True, exist_ok=True)
-        target = directory / source.name
-        if target.exists() and not overwrite:
-            raise ContentError(f"目标已存在：{source.name}")
+        target = directory / name
+        # 同名的禁用文件（foo.jar.disabled）也算已存在，否则导入后会出现两份同名内容。
+        disabled = directory / f"{name}{_DISABLED_SUFFIX}"
+        if (target.exists() or disabled.exists()) and not overwrite:
+            raise ContentError(f"目标已存在：{name}")
+        if overwrite and disabled.exists():
+            disabled.unlink(missing_ok=True)
 
         shutil.copy2(source, target)
         return target
@@ -289,6 +308,7 @@ class ContentManager:
         isolated: bool = False,
     ) -> None:
         """删除整个存档目录。"""
+        name = _require_name(name, "存档名")
         if isolated and version_id:
             directory = self._paths.saves_dir_for(version_id, isolated=True)
         else:

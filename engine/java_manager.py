@@ -12,7 +12,6 @@ import shutil
 import subprocess
 import tarfile
 import threading
-import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -31,6 +30,9 @@ ADOPTIUM_TIMEOUT = 12
 # 进度回调：入参为本次新增的字节数。
 ProgressFn = Callable[[int], None]
 CancelFn = Callable[[], bool]
+
+# JavaManager 每次调用都会新建实例，用模块级锁串行化「下载并解压同一个运行时」。
+_INSTALL_LOCK = threading.Lock()
 
 
 class JavaError(Exception):
@@ -297,6 +299,10 @@ class JavaManager:
 
         任何失败（不存在、超时、无权限等）都返回 ``None``，不抛异常。
         """
+        kwargs: dict = {}
+        if os.name == "nt":
+            # 避免探测 Java 时在桌面上闪出黑色控制台窗口。
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             proc = subprocess.run(
                 [executable, "-XshowSettings:properties", "-version"],
@@ -305,6 +311,7 @@ class JavaManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=PROBE_TIMEOUT,
+                **kwargs,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -318,7 +325,13 @@ class JavaManager:
         结果按 major 去重，同一 major 只保留版本号最高者。
         """
         infos: list[JavaInfo] = []
+        seen: set[str] = set()
         for candidate, source in self._iter_candidates():
+            # PATH / 系统目录 / 已下载运行时可能指向同一个可执行文件，先去重再探测。
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key in seen:
+                continue
+            seen.add(key)
             info = self.probe(candidate)
             if info is None:
                 continue
@@ -343,6 +356,9 @@ class JavaManager:
             if key in seen:
                 continue
             seen.add(key)
+            # 配置的 Java 正好满足要求时直接返回，不再扫描全机 Java（启动更快）。
+            if info.major == major:
+                return info
             infos.append(info)
 
         for info in self.scan():
@@ -493,6 +509,29 @@ class JavaManager:
     ) -> JavaInfo:
         """下载并解压 JRE 到 runtimes_dir，返回装好的 JavaInfo。
 
+        多个任务同时需要同一个 Java 时串行执行，避免并发写坏运行时目录。
+        """
+        # 等待其它任务安装 Java 时也响应取消。
+        while not _INSTALL_LOCK.acquire(timeout=0.5):
+            if cancel and cancel():
+                raise net.DownloadCancelled("已取消")
+        try:
+            return self._install_locked(
+                major, progress=progress, cancel=cancel, runtime=runtime
+            )
+        finally:
+            _INSTALL_LOCK.release()
+
+    def _install_locked(
+        self,
+        major: int,
+        *,
+        progress: Optional[ProgressFn] = None,
+        cancel: Optional[CancelFn] = None,
+        runtime: Optional[JavaRuntime] = None,
+    ) -> JavaInfo:
+        """下载并解压 JRE 到 runtimes_dir，返回装好的 JavaInfo。
+
         目标目录已存在且能 probe 成功时直接复用（幂等，不重复下载）。
         ``runtime`` 可由调用方传入，避免重复请求 Adoptium API。
         """
@@ -545,16 +584,14 @@ class JavaManager:
 
         archive.unlink(missing_ok=True)
 
+        if not java_bin.exists():
+            raise JavaError(f"Java {major} 解压失败：未找到 {java_bin}")
         info = self.probe(str(java_bin))
         if info is None:
-            info = JavaInfo(
-                path=str(java_bin),
-                version=runtime.version,
-                major=runtime.major,
-                vendor=runtime.vendor,
-                arch=runtime.arch,
-                source="downloaded",
+            # 不再伪造一个「安装成功」的结果；装完跑不起来时直接给出明确错误。
+            raise JavaError(
+                f"Java {major} 安装后无法运行：{java_bin}"
+                "（可能缺少系统依赖，请手动安装 Java 后在设置中指定路径）"
             )
-        else:
-            info.source = "downloaded"
+        info.source = "downloaded"
         return info

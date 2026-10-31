@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -144,8 +145,8 @@ class ConfigStore:
         data = {k: v for k, v in raw.items() if k in known}
         original_root = str(raw.get("root") or "")
         data["root"] = _normalize_root(raw.get("root"), self.data_dir)
-        if data.get("download_workers") == 16:  # 旧默认值，升级为新的并发默认
-            data["download_workers"] = 32
+        # 下载线程数是用户显式可配置的项，不能再把 16 强行改回 32，
+        # 否则用户在设置中调成 16 后每次启动都会被覆盖。
         config = LauncherConfig(**data)
         if original_root != data["root"]:
             # 迁移后的游戏目录立即写回，避免下次启动重复判断。
@@ -154,9 +155,12 @@ class ConfigStore:
 
     def save(self, config: LauncherConfig) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
+        # 先写临时文件再原子替换，避免关闭 / 断电时留下半截配置文件。
+        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+        tmp.write_text(
             json.dumps(config.as_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        os.replace(tmp, self.config_path)
 
 
 def _normalize_root(raw_root: object, data_dir: Path) -> str:

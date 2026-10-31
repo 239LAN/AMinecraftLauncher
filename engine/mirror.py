@@ -4,12 +4,15 @@
 - 只做「URL 重写 + 候选列表」，不改变上层调用方式；
 - ``download_file`` / ``get_json`` / ``fetch_bytes`` 会依次尝试候选地址，
   因此单个文件可以先走镜像、失败再走官方，无需上层感知；
+- 大文件分片下载时，下载器会轮换每个分片的候选顺序：相邻分片分别优先走
+  镜像 / 官方源，两个源都可用时同时下载；任一源失败时该分片再回退另一个源；
 - 不参与重写的是 OAuth / API 类请求（Modrinth、微软登录等），
   这些接口本就没有镜像，走 ``request_json`` 不经过候选逻辑。
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,6 +42,8 @@ BMCLAPI_RULES.sort(key=lambda rule: len(rule[0]), reverse=True)
 
 # 探针：一个体积小、必定存在的镜像地址。
 PROBE_URL = f"{BMCLAPI_ROOT}/mc/game/version_manifest_v2.json"
+# 官方源探针：用于判断能否让镜像与官方源同时下载（官方不可达时只用镜像）。
+OFFICIAL_PROBE_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 
 SOURCE_OFFICIAL = "official"
 SOURCE_BMCLAPI = "bmclapi"
@@ -81,6 +86,11 @@ class MirrorManager:
         self.mirror_enabled = self.source != SOURCE_OFFICIAL
         self.latency_ms = 0
         self.checked_at = 0.0
+        # 官方源是否可达：可达时允许镜像与官方源同时下载不同分片。
+        self.official_available = False
+        self.official_latency_ms = 0
+        self.official_checked_at = 0.0
+        self._official_probe: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------- 候选择序
     @property
@@ -98,8 +108,13 @@ class MirrorManager:
             return [url]
         return [mirrored, url]
 
+    def dual_source(self) -> bool:
+        """镜像与官方源是否都可用（决定是否让两个源同时承担分片下载）。"""
+        return self.active == SOURCE_BMCLAPI and self.official_available
+
     def install(self) -> None:
         net.set_url_candidates(self.candidates)
+        net.set_dual_source_policy(self.dual_source)
 
     def set_source(self, source: str) -> None:
         self.source = source if source in {SOURCE_AUTO, SOURCE_OFFICIAL, SOURCE_BMCLAPI} else SOURCE_AUTO
@@ -107,11 +122,12 @@ class MirrorManager:
 
     # ------------------------------------------------------------------ 测速
     def probe(self) -> MirrorStatus:
-        """探测 BMCLAPI 可用性；失败则在本次会话内退回官方源。"""
+        """探测下载源可用性；镜像失败时本次会话内退回官方源。"""
         if self.source == SOURCE_OFFICIAL:
             self.mirror_enabled = False
             return self.status()
 
+        self._probe_official_in_background()
         start = time.monotonic()
         try:
             with net._open(PROBE_URL, timeout=self.probe_timeout) as response:  # noqa: SLF001
@@ -124,6 +140,29 @@ class MirrorManager:
             self.mirror_enabled = self.source == SOURCE_BMCLAPI
         self.checked_at = time.time()
         return self.status()
+
+    def _probe_official_in_background(self) -> None:
+        """官方源探测放到后台线程，避免拖慢镜像探测 / 启动。"""
+        if self._official_probe is not None and self._official_probe.is_alive():
+            return
+        self._official_probe = threading.Thread(
+            target=self._probe_official, daemon=True
+        )
+        self._official_probe.start()
+
+    def _probe_official(self) -> None:
+        start = time.monotonic()
+        try:
+            with net._open(  # noqa: SLF001
+                OFFICIAL_PROBE_URL, timeout=min(self.probe_timeout, 5.0)
+            ) as response:
+                response.read(256)
+            self.official_latency_ms = int((time.monotonic() - start) * 1000)
+            self.official_available = True
+        except Exception:  # noqa: BLE001 - 官方不可达时保持单镜像下载
+            self.official_latency_ms = 0
+            self.official_available = False
+        self.official_checked_at = time.time()
 
     def status(self) -> MirrorStatus:
         return MirrorStatus(

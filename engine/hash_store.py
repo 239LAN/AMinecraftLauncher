@@ -52,6 +52,14 @@ def _linkable(rel: str) -> bool:
     return rel.endswith(".jar") or rel.startswith(LINK_PREFIXES)
 
 
+def _is_partial_file(name: str) -> bool:
+    """下载中的临时文件：``*.part``、``*.tmp`` 以及分片 ``*.part0`` / ``*.part1``。"""
+    if name.endswith((".part", ".tmp")):
+        return True
+    _, sep, suffix = name.rpartition(".part")
+    return bool(sep) and suffix.isdigit()
+
+
 def _safe_rel(rel: str) -> str:
     rel = rel.replace("\\", "/").strip("/")
     if not rel or rel.startswith("../") or "/../" in rel or rel.startswith("/"):
@@ -139,7 +147,7 @@ class HashStore:
                 dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__"}]
                 for name in filenames:
                     path = Path(dirpath) / name
-                    if name == RUN_MARKER or name.endswith((".part", ".tmp")) or not path.is_file():
+                    if name == RUN_MARKER or _is_partial_file(name) or not path.is_file():
                         continue
                     rel = _safe_rel(path.relative_to(root).as_posix())
                     stat = path.stat()
@@ -180,20 +188,28 @@ class HashStore:
             }
 
     def _write_blob(self, source: Path, blob: Path, *, compress: bool) -> bool:
-        """写入哈希块；可压缩内容加魔数头，返回是否实际压缩。"""
+        """写入哈希块；可压缩内容加魔数头，返回是否实际压缩。
+
+        全程按块读写，避免把几百 MB 的游戏文件一次性读进内存。
+        """
         blob.parent.mkdir(parents=True, exist_ok=True)
         tmp = blob.with_name(blob.name + ".tmp")
-        raw = source.read_bytes()
-        data = raw
         packed = False
-        if compress and len(raw) >= COMPRESS_MIN_SIZE:
-            candidate = zlib.compress(raw, 6)
-            if len(candidate) + len(COMPRESS_MAGIC) < len(raw):
-                data = COMPRESS_MAGIC + candidate
-                packed = True
-        if packed:
-            tmp.write_bytes(data)
-        else:
+        if compress and source.stat().st_size >= COMPRESS_MIN_SIZE:
+            candidate = tmp.with_name(tmp.name + ".z")
+            try:
+                with open(source, "rb") as src, open(candidate, "wb") as out:
+                    out.write(COMPRESS_MAGIC)
+                    compressor = zlib.compressobj(6)
+                    for block in iter(lambda: src.read(HASH_CHUNK), b""):
+                        out.write(compressor.compress(block))
+                    out.write(compressor.flush())
+                if candidate.stat().st_size < source.stat().st_size:
+                    os.replace(candidate, tmp)
+                    packed = True
+            finally:
+                candidate.unlink(missing_ok=True)
+        if not packed:
             shutil.copy2(source, tmp)
         os.replace(tmp, blob)
         return packed
@@ -240,7 +256,12 @@ class HashStore:
             with open(blob, "rb") as handle:
                 packed = handle.read(len(COMPRESS_MAGIC)) == COMPRESS_MAGIC
             if packed:
-                target.write_bytes(zlib.decompress(blob.read_bytes()[len(COMPRESS_MAGIC):]))
+                with open(blob, "rb") as src, open(target, "wb") as out:
+                    src.seek(len(COMPRESS_MAGIC))
+                    decompressor = zlib.decompressobj()
+                    for block in iter(lambda: src.read(HASH_CHUNK), b""):
+                        out.write(decompressor.decompress(block))
+                    out.write(decompressor.flush())
             else:
                 shutil.copy2(blob, target)
             try:
