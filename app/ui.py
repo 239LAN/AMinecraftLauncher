@@ -32,6 +32,14 @@ NAV_ITEMS = [
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
     {
+        "version": "1.2.1",
+        "title": "窗口修复",
+        "notes": """\
+- 修复无边框窗口最大化后覆盖任务栏的问题，最大化时自动贴合当前屏幕可用工作区
+- 多显示器下按窗口所在屏幕计算最大化区域，还原时回到最大化前的位置与尺寸
+""",
+    },
+    {
         "version": "1.2.0",
         "title": "全量修复 · 体验优化",
         "notes": """\
@@ -714,8 +722,29 @@ class LauncherUI:
             window.restore()
             self._is_maximized = False
         else:
+            self._limit_maximize_to_work_area(window)
             window.maximize()
             self._is_maximized = True
+
+    @staticmethod
+    def _limit_maximize_to_work_area(window) -> None:
+        """无边框窗口最大化会盖住任务栏，这里把最大化范围限制在当前屏幕工作区。"""
+        form = getattr(window, "native", None)
+        if form is None:
+            return
+        try:
+            import clr
+
+            clr.AddReference("System.Windows.Forms")
+            from System import Func, Type
+            from System.Windows.Forms import Screen
+
+            def _apply() -> None:
+                form.MaximizedBounds = Screen.FromControl(form).WorkingArea
+
+            form.Invoke(Func[Type](_apply))
+        except Exception:  # noqa: BLE001 - 环境差异时退回默认最大化
+            return
 
     def _win_close(self) -> None:
         if self._native_window() is None:
