@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import tempfile
 import threading
 import time
@@ -31,6 +30,20 @@ NAV_ITEMS = [
 
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
+    {
+        "version": "1.3.0",
+        "title": "加载器 · Mod 管理 · 存档服务器",
+        "notes": """\
+- 下载安装游戏时可直接选择 Fabric / Forge / NeoForge / Quilt 及加载器版本
+- 安装时可自定义版本名称，同一原版版本可共存多份；版本页支持重命名
+- 导入本地或在线整合包时，确认弹窗内可直接命名版本
+- Mod 列表读取 JAR 元数据，显示模组名称、版本与图标，不再是文件名
+- 新增 Mod 启用 / 禁用（重命名 .disabled），状态一目了然
+- 进入 Mod 管理时自动检查更新：按 SHA1 反查 Modrinth，匹配当前游戏版本与加载器后显示更新标记，可一键更新
+- 新增存档管理：备份为 zip、导入存档、删除存档、打开存档目录
+- 新增服务器管理：读取与写入 servers.dat，添加和删除服务器
+""",
+    },
     {
         "version": "1.2.1",
         "title": "窗口修复",
@@ -158,6 +171,7 @@ AML_CSS = """
   --aml-bg: #f6f7f9;
   --aml-surface: #ffffff;
   --aml-border: #e5e7eb;
+  --aml-surface-2: #f9fafb;
   --aml-text: #111827;
   --aml-muted: #6b7280;
   --aml-accent: #2563eb;
@@ -547,6 +561,13 @@ def _fmt_speed(value: float) -> str:
             return f"{speed:.0f} {unit}" if unit == "B/s" else f"{speed:.1f} {unit}"
         speed /= 1024
     return f"{speed:.1f} GB/s"
+
+
+def _sanitize_version_name(text: str) -> str:
+    """去掉 Windows 目录名不允许的字符。"""
+    bad = '\\/:*?"<>|'
+    cleaned = "".join("-" if ch in bad else ch for ch in str(text or ""))
+    return cleaned.strip().strip(".")
 
 
 class ImportDrop:
@@ -1484,27 +1505,47 @@ class LauncherUI:
                         on_click=lambda _=None, v=version_id: self._set_current_version(v),
                     ).props("flat dense no-caps")
                     ui.button(
+                        "重命名", icon="edit",
+                        on_click=lambda _=None, v=version_id: self._open_rename_version(v),
+                    ).props("flat dense no-caps")
+                    ui.button(
                         "删除", icon="delete",
                         on_click=lambda _=None, v=version_id: self._open_delete_version(v),
                     ).props("flat dense no-caps color=negative")
 
             ui.toggle(
-                {"mods": "Mod 管理", "settings": "版本设置"},
+                {
+                    "mods": "Mod 管理",
+                    "saves": "存档",
+                    "servers": "服务器",
+                    "settings": "版本设置",
+                },
                 value=self.version_tab,
                 on_change=lambda e: self._switch_version_tab(e.value),
             ).props("unelevated dense no-caps toggle-color=primary").classes("self-start")
 
             mods_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-mods")
+            saves_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-saves")
+            servers_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-servers")
             settings_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-settings")
             with mods_box:
                 self._build_version_mods(version_id)
+            with saves_box:
+                self._build_version_saves(version_id)
+            with servers_box:
+                self._build_version_servers(version_id)
             with settings_box:
                 self._build_version_repair(version_id)
                 self._build_version_settings(version_id)
                 self._build_version_loader(version_id)
                 self._build_version_crash(version_id)
 
-        self.version_tab_boxes = {"mods": mods_box, "settings": settings_box}
+        self.version_tab_boxes = {
+            "mods": mods_box,
+            "saves": saves_box,
+            "servers": servers_box,
+            "settings": settings_box,
+        }
         self._switch_version_tab(self.version_tab)
         self._play("aml-version-detail")
 
@@ -1540,6 +1581,37 @@ class LauncherUI:
 
         self.open_dialog("删除版本", builder)
 
+    def _open_rename_version(self, version_id: str) -> None:
+        def builder() -> None:
+            name = ui.input(label="新版本名称", value=version_id).classes("w-full").props(
+                "dense outlined"
+            )
+            ui.label("重命名会同步修改版本目录、JSON 与版本设置。").classes("aml-sub")
+
+            async def do_rename() -> None:
+                new_id = _sanitize_version_name((name.value or "").strip())
+                if not new_id or new_id == version_id:
+                    self.dialog.close()
+                    return
+                try:
+                    await run.io_bound(self.service.rename_version, version_id, new_id)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"重命名失败：{exc}", type="negative", position="top-right")
+                    return
+                self.dialog.close()
+                self.detail_version_id = new_id
+                self._refresh_home()
+                self._reload_version_list()
+                ui.notify(f"已重命名为 {new_id}", type="positive", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button("确认重命名", icon="edit", on_click=do_rename).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+        self.open_dialog("重命名版本", builder)
+
     def _build_version_repair(self, version_id: str) -> None:
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
@@ -1574,10 +1646,55 @@ class LauncherUI:
             "mod", version_id=version_id, isolated=self.service._is_isolated(version_id)
         )
         safe_id = "".join(ch if ch.isalnum() else "-" for ch in version_id)
+        updates: dict[str, dict] = {}
+
+        async def refresh_mods(check: bool = False, notify: bool = False) -> None:
+            mod_list.clear()
+            with mod_list:
+                with ui.row().classes("w-full items-center justify-center p-4"):
+                    ui.spinner(size="sm").style("color: var(--aml-accent)")
+            try:
+                items = await run.io_bound(self.service.content_list, "mod", version_id)
+            except Exception as exc:  # noqa: BLE001
+                items = []
+                ui.notify(f"读取 Mod 失败：{exc}", type="negative", position="top-right")
+            mod_list.clear()
+            with mod_list:
+                if not items:
+                    ui.label("暂无 Mod").classes("aml-sub")
+                for item in items:
+                    self._mod_row(version_id, item, updates, reload_mods)
+            if check:
+                try:
+                    found = await run.io_bound(self.service.check_mod_updates, version_id)
+                except Exception:  # noqa: BLE001
+                    found = {}
+                updates.clear()
+                updates.update(found or {})
+                if found:
+                    ui.notify(
+                        f"{len(found)} 个 Mod 有可用更新",
+                        type="info",
+                        position="top-right",
+                    )
+                    await refresh_mods(False)
+                elif notify:
+                    ui.notify("所有 Mod 都是最新的", type="positive", position="top-right")
+
+        def reload_mods() -> None:
+            background_tasks.create(refresh_mods(False))
+
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
                 ui.label("Mod 管理").classes("text-[14px] font-semibold")
-                ui.button("刷新", icon="refresh", on_click=lambda: reload_mods()).props("flat dense no-caps")
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button(
+                        "检查更新", icon="update",
+                        on_click=lambda: background_tasks.create(refresh_mods(True, True)),
+                    ).props("flat dense no-caps")
+                    ui.button("刷新", icon="refresh", on_click=reload_mods).props(
+                        "flat dense no-caps"
+                    )
             ui.label(f"目录：{mods_dir}").classes("aml-sub")
 
             async def on_mod_files(event) -> None:
@@ -1590,40 +1707,95 @@ class LauncherUI:
             ).build()
             mod_list = ui.column().classes("w-full gap-1")
 
-        def reload_mods() -> None:
-            mod_list.clear()
-            try:
-                items = self.service.content_list("mod", version_id)
-            except Exception as exc:  # noqa: BLE001
-                with mod_list:
-                    ui.label(f"读取失败：{exc}").classes("aml-sub")
-                return
-            with mod_list:
-                if not items:
-                    ui.label("暂无 Mod").classes("aml-sub")
-                for item in items:
-                    with ui.row().classes(
-                        "w-full items-center justify-between no-wrap px-2 py-1 rounded"
-                    ).style("background: var(--aml-surface-2)"):
-                        with ui.column().classes("gap-0 min-w-0"):
-                            with ui.row().classes("items-center gap-2 no-wrap"):
-                                ui.label(item["filename"]).classes("text-[13px]")
-                                ui.label("已启用" if item["enabled"] else "已禁用").classes(
-                                    "aml-chip installed" if item["enabled"] else "aml-chip"
-                                )
-                            ui.label(_fmt_size(item.get("size") or 0)).classes("aml-sub")
-                        with ui.row().classes("gap-1 shrink-0 no-wrap"):
-                            ui.button(
-                                "禁用" if item["enabled"] else "启用",
-                                on_click=lambda _=None, i=item: self._toggle_mod(version_id, i, reload_mods),
-                            ).props("flat dense no-caps")
-                            ui.button(
-                                "删除",
-                                on_click=lambda _=None, f=item["filename"]: self._delete_mod(
-                                    version_id, f, reload_mods
-                                ),
-                            ).props("flat dense no-caps color=negative")
+        background_tasks.create(refresh_mods(True))
 
+    def _mod_row(
+        self,
+        version_id: str,
+        item: dict,
+        updates: dict[str, dict],
+        reload_mods: Callable[[], None],
+    ) -> None:
+        update = updates.get(item["filename"])
+        with ui.row().classes(
+            "w-full items-center gap-3 no-wrap px-2 py-2 rounded-lg"
+        ).style("background: var(--aml-surface-2)"):
+            if item.get("icon"):
+                ui.image(item["icon"]).classes("w-[40px] h-[40px] rounded-md shrink-0").style(
+                    "object-fit: cover"
+                )
+            else:
+                with ui.element("div").classes(
+                    "w-[40px] h-[40px] rounded-md flex items-center justify-center shrink-0"
+                ).style("background: #eef0f3"):
+                    ui.icon("extension").classes("text-[22px]").style(
+                        "color: var(--aml-muted)"
+                    )
+            with ui.column().classes("flex-1 min-w-0 gap-0.5"):
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.label(item.get("display_name") or item["filename"]).classes(
+                        "text-[13px] font-medium truncate"
+                    )
+                    if item.get("mod_version"):
+                        ui.label(f"v{item['mod_version']}").classes("aml-chip")
+                    if update:
+                        ui.label("有更新").classes("aml-chip warn")
+                    ui.label("已启用" if item["enabled"] else "已禁用").classes(
+                        "aml-chip installed" if item["enabled"] else "aml-chip"
+                    )
+                ui.label(
+                    f"{item['filename']} · {_fmt_size(item.get('size') or 0)}"
+                ).classes("aml-sub truncate")
+                if update:
+                    ui.label(
+                        f"可更新：{update.get('current_version') or '当前版本'} → "
+                        f"{update.get('new_version') or '新版本'}"
+                    ).classes("aml-sub")
+            with ui.row().classes("gap-1 shrink-0 no-wrap"):
+                if update and item["enabled"]:
+                    ui.button(
+                        "更新", icon="upgrade",
+                        on_click=lambda _=None, i=item, u=update: background_tasks.create(
+                            self._do_update_mod(version_id, i, u, reload_mods)
+                        ),
+                    ).props("flat dense no-caps color=primary")
+                ui.button(
+                    "禁用" if item["enabled"] else "启用",
+                    on_click=lambda _=None, i=item: self._toggle_mod(
+                        version_id, i, reload_mods
+                    ),
+                ).props("flat dense no-caps")
+                ui.button(
+                    "删除",
+                    on_click=lambda _=None, f=item["filename"]: self._delete_mod(
+                        version_id, f, reload_mods
+                    ),
+                ).props("flat dense no-caps color=negative")
+
+    async def _do_update_mod(
+        self,
+        version_id: str,
+        item: dict,
+        update: dict,
+        reload_mods: Callable[[], None],
+    ) -> None:
+        try:
+            await run.io_bound(
+                self.service.update_mod,
+                version_id,
+                item["filename"],
+                update["url"],
+                update["filename"],
+                expected_sha1=update.get("sha1") or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"更新失败：{exc}", type="negative", position="top-right")
+            return
+        ui.notify(
+            f"已更新 {item.get('display_name') or item['filename']}",
+            type="positive",
+            position="top-right",
+        )
         reload_mods()
 
     async def _handle_mod_uploads(
@@ -1682,6 +1854,242 @@ class LauncherUI:
             return
         ui.notify(f"已删除 {filename}", position="top-right")
         reload_mods()
+
+    # ------------------------------------------------------------ 版本：存档
+    def _build_version_saves(self, version_id: str) -> None:
+        safe_id = "".join(ch if ch.isalnum() else "-" for ch in version_id)
+        save_list = None
+
+        async def refresh_saves() -> None:
+            save_list.clear()
+            with save_list:
+                with ui.row().classes("w-full items-center justify-center p-4"):
+                    ui.spinner(size="sm").style("color: var(--aml-accent)")
+            try:
+                saves = await run.io_bound(self.service.list_saves, version_id)
+            except Exception as exc:  # noqa: BLE001
+                saves = []
+                ui.notify(f"读取存档失败：{exc}", type="negative", position="top-right")
+            save_list.clear()
+            with save_list:
+                if not saves:
+                    ui.label("暂无存档").classes("aml-sub")
+                for save in saves:
+                    with ui.row().classes(
+                        "w-full items-center gap-3 no-wrap px-2 py-2 rounded-lg"
+                    ).style("background: var(--aml-surface-2)"):
+                        with ui.element("div").classes(
+                            "w-[36px] h-[36px] rounded-md flex items-center justify-center shrink-0"
+                        ).style("background: #eef0f3"):
+                            ui.icon("save").classes("text-[20px]").style(
+                                "color: var(--aml-muted)"
+                            )
+                        with ui.column().classes("flex-1 min-w-0 gap-0.5"):
+                            ui.label(save["name"]).classes("text-[13px] font-medium truncate")
+                            ui.label(
+                                f"{_fmt_size(save.get('size') or 0)} · "
+                                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(save.get('modified') or 0))}"
+                            ).classes("aml-sub")
+                        with ui.row().classes("gap-1 shrink-0 no-wrap"):
+                            ui.button(
+                                "备份", icon="archive",
+                                on_click=lambda _=None, n=save["name"]: background_tasks.create(
+                                    self._backup_save(version_id, n)
+                                ),
+                            ).props("flat dense no-caps")
+                            ui.button(
+                                "删除",
+                                on_click=lambda _=None, n=save["name"]: self._confirm_delete_save(
+                                    version_id, n, reload_saves
+                                ),
+                            ).props("flat dense no-caps color=negative")
+
+        def reload_saves() -> None:
+            background_tasks.create(refresh_saves())
+
+        async def on_save_files(event) -> None:
+            files = list(getattr(event, "files", []) or [])
+            if not files:
+                return
+            file = files[0]
+            filename = Path(file.name).name
+            drop.busy(f"正在导入 {filename}…")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as handle:
+                temp_path = Path(handle.name)
+            try:
+                await self._save_upload(file, temp_path)
+                await run.io_bound(self.service.import_save, str(temp_path), version_id)
+            except Exception as exc:  # noqa: BLE001
+                ui.notify(f"导入存档失败：{exc}", type="negative", position="top-right")
+            else:
+                ui.notify(f"已导入存档 {Path(filename).stem}", type="positive", position="top-right")
+                reload_saves()
+            finally:
+                temp_path.unlink(missing_ok=True)
+                drop.idle()
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label("存档管理").classes("text-[14px] font-semibold")
+                ui.button(
+                    "打开目录", icon="folder_open",
+                    on_click=lambda: self._open_saves_dir(version_id),
+                ).props("flat dense no-caps")
+            drop = ImportDrop(
+                upload_id=f"aml-save-upload-{safe_id}",
+                hint="点击选择或拖入存档 zip（解压到 saves/<文件名>）",
+                handler=on_save_files,
+                multiple=False,
+            ).build()
+            save_list = ui.column().classes("w-full gap-1")
+
+        background_tasks.create(refresh_saves())
+
+    def _open_saves_dir(self, version_id: str) -> None:
+        base = self.service.paths().version_game_dir(
+            version_id, isolated=self.service._is_isolated(version_id)
+        )
+        try:
+            self.service.open_path(str(base / "saves"))
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"打开目录失败：{exc}", type="negative", position="top-right")
+
+    async def _backup_save(self, version_id: str, name: str) -> None:
+        try:
+            result = await run.io_bound(self.service.backup_save, name, version_id)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"备份失败：{exc}", type="negative", position="top-right")
+            return
+        ui.notify(f"已备份到 {result['path']}", type="positive", position="top-right")
+
+    def _confirm_delete_save(
+        self, version_id: str, name: str, refresh: Callable[[], None]
+    ) -> None:
+        def builder() -> None:
+            ui.label(f"确定删除存档 {name}？").classes("text-[15px] font-semibold")
+            ui.label("存档目录会被永久删除。").classes("aml-sub")
+
+            async def do_delete() -> None:
+                try:
+                    await run.io_bound(self.service.delete_save, name, version_id)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"删除失败：{exc}", type="negative", position="top-right")
+                    return
+                self.dialog.close()
+                refresh()
+                ui.notify(f"已删除存档 {name}", position="top-right")
+
+            ui.button("确认删除", icon="delete", on_click=do_delete).props(
+                "unelevated dense no-caps color=negative"
+            )
+
+        self.open_dialog("删除存档", builder)
+
+    # ------------------------------------------------------------ 版本：服务器
+    def _build_version_servers(self, version_id: str) -> None:
+        server_list = None
+
+        async def refresh_servers() -> None:
+            server_list.clear()
+            try:
+                servers = await run.io_bound(self.service.list_servers, version_id)
+            except Exception as exc:  # noqa: BLE001
+                servers = []
+                ui.notify(f"读取服务器失败：{exc}", type="negative", position="top-right")
+            server_list.clear()
+            with server_list:
+                if not servers:
+                    ui.label("暂无服务器").classes("aml-sub")
+                for index, server in enumerate(servers):
+                    with ui.row().classes(
+                        "w-full items-center gap-3 no-wrap px-2 py-2 rounded-lg"
+                    ).style("background: var(--aml-surface-2)"):
+                        with ui.element("div").classes(
+                            "w-[36px] h-[36px] rounded-md flex items-center justify-center shrink-0"
+                        ).style("background: #eef0f3"):
+                            ui.icon("dns").classes("text-[20px]").style(
+                                "color: var(--aml-muted)"
+                            )
+                        with ui.column().classes("flex-1 min-w-0 gap-0.5"):
+                            ui.label(server.get("name") or server.get("ip")).classes(
+                                "text-[13px] font-medium truncate"
+                            )
+                            ui.label(server.get("ip") or "").classes("aml-sub truncate")
+                        ui.button(
+                            "删除",
+                            on_click=lambda _=None, i=index: self._confirm_delete_server(
+                                version_id, i, reload_servers
+                            ),
+                        ).props("flat dense no-caps color=negative")
+
+        def reload_servers() -> None:
+            background_tasks.create(refresh_servers())
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label("服务器管理").classes("text-[14px] font-semibold")
+                ui.button(
+                    "添加服务器", icon="add",
+                    on_click=lambda: self._open_add_server(version_id, reload_servers),
+                ).props("unelevated dense no-caps color=primary")
+            ui.label("写入当前游戏目录的 servers.dat，启动游戏后可在多人游戏中看到").classes(
+                "aml-sub"
+            )
+            server_list = ui.column().classes("w-full gap-1")
+
+        background_tasks.create(refresh_servers())
+
+    def _open_add_server(self, version_id: str, refresh: Callable[[], None]) -> None:
+        def builder() -> None:
+            name = ui.input(label="名称（可留空）").classes("w-full").props("dense outlined")
+            address = ui.input(label="服务器地址", value="localhost:25565").classes(
+                "w-full"
+            ).props("dense outlined")
+
+            async def do_add() -> None:
+                try:
+                    await run.io_bound(
+                        self.service.add_server,
+                        name.value or "",
+                        address.value or "",
+                        version_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"添加失败：{exc}", type="negative", position="top-right")
+                    return
+                self.dialog.close()
+                refresh()
+                ui.notify("服务器已添加", type="positive", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button("添加", icon="add", on_click=do_add).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+        self.open_dialog("添加服务器", builder)
+
+    def _confirm_delete_server(
+        self, version_id: str, index: int, refresh: Callable[[], None]
+    ) -> None:
+        def builder() -> None:
+            ui.label("确定删除这个服务器？").classes("text-[15px] font-semibold")
+
+            async def do_delete() -> None:
+                try:
+                    await run.io_bound(self.service.delete_server, index, version_id)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"删除失败：{exc}", type="negative", position="top-right")
+                    return
+                self.dialog.close()
+                refresh()
+                ui.notify("服务器已删除", position="top-right")
+
+            ui.button("确认删除", icon="delete", on_click=do_delete).props(
+                "unelevated dense no-caps color=negative"
+            )
+
+        self.open_dialog("删除服务器", builder)
 
     # ------------------------------------------------------------ 版本：启动设置
     def _build_version_settings(self, version_id: str) -> None:
@@ -2038,13 +2446,94 @@ class LauncherUI:
                     if not version.get("installed"):
                         ui.button(
                             "安装",
-                            on_click=lambda _=None, v=version: self._install_game(v["id"]),
+                            on_click=lambda _=None, v=version: self._open_install_dialog(v["id"]),
                         ).props("unelevated dense no-caps color=primary").classes("shrink-0")
 
-    def _install_game(self, version_id: str) -> None:
-        self.service.start_install(version_id)
-        self._select_view("tasks")
-        ui.notify(f"已开始安装 {version_id}，进度见「任务」页", position="top-right")
+    def _unique_version_name(self, base: str) -> str:
+        name = _sanitize_version_name(base) or "version"
+        used = set(self.service.installed_versions())
+        if name not in used:
+            return name
+        index = 2
+        while f"{name}-{index}" in used:
+            index += 1
+        return f"{name}-{index}"
+
+    def _open_install_dialog(self, version_id: str) -> None:
+        default_name = self._unique_version_name(version_id)
+
+        def builder() -> None:
+            ui.label(
+                "可自定义版本名称，安装到独立目录；同一原版版本可以共存多份。"
+            ).classes("aml-sub")
+            name = ui.input(label="版本名称", value=default_name).classes("w-full").props(
+                "dense outlined"
+            )
+            loader = ui.select(
+                {"": "原版（不安装加载器）", **{key: LOADER_LABELS[key] for key in LOADERS}},
+                value="",
+                label="模组加载器",
+            ).classes("w-full").props("dense outlined")
+            loader_version = ui.select(
+                options=[], label="加载器版本", with_input=True
+            ).classes("w-full").props("dense outlined")
+
+            async def refresh_loader_versions() -> None:
+                if not loader.value:
+                    loader_version.options = []
+                    loader_version.value = None
+                    loader_version.update()
+                    return
+                try:
+                    items = await run.io_bound(
+                        self.service.loader_versions, loader.value, version_id
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(
+                        f"获取加载器版本失败：{exc}", type="negative", position="top-right"
+                    )
+                    return
+                options = [item["version"] for item in items]
+                stable = [item["version"] for item in items if item.get("stable")]
+                loader_version.options = options
+                loader_version.value = (stable or options or [None])[0]
+                loader_version.update()
+
+            loader.on_value_change(
+                lambda _=None: background_tasks.create(refresh_loader_versions())
+            )
+
+            def start() -> None:
+                target = _sanitize_version_name((name.value or "").strip()) or default_name
+                if target in self.service.installed_versions():
+                    ui.notify(f"版本名 {target} 已存在，请换一个名称", type="warning", position="top-right")
+                    return
+                chosen = loader.value or ""
+                chosen_version = (loader_version.value or "") if chosen else ""
+                if chosen and not chosen_version:
+                    ui.notify("请选择加载器版本", type="warning", position="top-right")
+                    return
+                self.dialog.close()
+                try:
+                    self.service.start_install(
+                        version_id,
+                        name=target,
+                        loader=chosen,
+                        loader_version=chosen_version,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"开始安装失败：{exc}", type="negative", position="top-right")
+                    return
+                self._select_view("tasks")
+                ui.notify(f"已开始安装 {target}，进度见「任务」页", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button(
+                    "开始安装", icon="download", on_click=start
+                ).props("unelevated dense no-caps color=primary")
+
+        self.open_dialog(f"安装 {version_id}", builder)
 
     # ------------------------------------------------- 下载：Mod / 资源包 / 光影
     def _build_content_download(self, kind: str) -> None:
@@ -2258,11 +2747,45 @@ class LauncherUI:
             ).props("unelevated dense no-caps color=primary").classes("shrink-0 mt-1")
 
     def _install_online_modpack(self, item: dict) -> None:
-        self.service.start_online_modpack_install(
-            item["source"], item["project_id"], name=item["name"]
-        )
-        self._select_view("tasks")
-        ui.notify(f"已开始安装 {item['name']}，进度见「任务」页", position="top-right")
+        default_name = self._unique_version_name(item.get("name") or "modpack")
+
+        def builder() -> None:
+            ui.label(item.get("name") or item.get("project_id")).classes(
+                "text-[15px] font-semibold"
+            )
+            ui.label(
+                "按整合包内声明的游戏版本与加载器安装到独立版本目录，并自动开启版本隔离。"
+            ).classes("aml-sub")
+            name = ui.input(label="版本名称（可自定义）", value=default_name).classes(
+                "w-full"
+            ).props("dense outlined")
+
+            def do_install() -> None:
+                target = _sanitize_version_name((name.value or "").strip()) or default_name
+                if target in self.service.installed_versions():
+                    ui.notify(f"版本名 {target} 已存在，请换一个名称", type="warning", position="top-right")
+                    return
+                self.dialog.close()
+                try:
+                    self.service.start_online_modpack_install(
+                        item["source"],
+                        item["project_id"],
+                        name=item["name"],
+                        version_name=target,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"开始安装失败：{exc}", type="negative", position="top-right")
+                    return
+                self._select_view("tasks")
+                ui.notify(f"已开始安装 {target}，进度见「任务」页", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button("确认安装", icon="download", on_click=do_install).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+        self.open_dialog("安装整合包", builder)
 
     async def _handle_modpack_files(self, event, drop: ImportDrop) -> None:
         files = list(getattr(event, "files", []) or [])
@@ -2299,53 +2822,58 @@ class LauncherUI:
             ui.notify("无法从整合包确定游戏版本", type="warning", position="top-right")
             return
 
-        label = f"{info.get('name') or filename} · {version_id}"
-        if info.get("loader"):
-            label += f" {info['loader']}"
-        drop.busy(f"正在导入 {label}", percent=0)
-        task = self.service.start_modpack_install(str(target), version_id=version_id)
-        status, error = await self._await_import_task(task, drop, label)
         drop.idle()
-        self._download_stale = True
-        self._refresh_home()
-        if self.current_view == "versions":
-            self._reload_version_list()
-        if status == "done":
-            ui.notify(f"整合包已导入：{label}", type="positive", position="top-right")
-        elif error:
-            ui.notify(f"导入失败：{error}", type="negative", position="top-right")
-        else:
-            ui.notify("导入已取消", type="warning", position="top-right")
+        self._confirm_modpack_install(target, info, filename)
 
-    async def _await_import_task(self, task, drop: ImportDrop, label: str) -> tuple[str, str]:
-        """轮询导入任务，把进度直接写回导入卡片。"""
-        while True:
-            snapshot = self.service.tasks.snapshot(task.id)
-            if snapshot is None:
-                return "failed", "任务已结束"
-            status = str(snapshot.get("status") or "running")
-            if status not in {"done", "failed", "cancelled"}:
-                progress = snapshot.get("progress") or {}
-                if progress.get("type") == "phase":
-                    phase = str(progress.get("phase") or "")
-                    text = PHASE_LABELS.get(phase, phase or "处理中")
-                    done = int(progress.get("done", 0) or 0)
-                    total = int(progress.get("total", 0) or 0)
-                    if total:
-                        text += f" {done}/{total}"
-                    drop.busy(
-                        f"正在导入 {label} · {text}",
-                        percent=(done / total * 100) if total else None,
+    def _confirm_modpack_install(
+        self, archive: Path, info: dict, filename: str
+    ) -> None:
+        game_version = str(info.get("game_version") or "")
+        default_name = self._unique_version_name(
+            str(info.get("name") or Path(filename).stem or game_version)
+        )
+        loader = str(info.get("loader") or "")
+        loader_version = str(info.get("loader_version") or "")
+
+        def builder() -> None:
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.label(str(info.get("name") or filename)).classes("text-[15px] font-semibold")
+                ui.label(str(info.get("format") or "")).classes("aml-chip")
+                ui.label(game_version).classes("aml-chip primary")
+                if loader:
+                    ui.label(f"{loader} {loader_version}".strip()).classes("aml-chip")
+            ui.label(
+                f"游戏版本 {game_version or '未知'} · 文件 {info.get('file_count', 0)} 个 · "
+                f"覆盖 {info.get('override_count', 0)} 个"
+            ).classes("aml-sub")
+            name = ui.input(label="版本名称（可自定义）", value=default_name).classes(
+                "w-full"
+            ).props("dense outlined")
+            ui.label("整合包会安装到独立版本目录并自动开启版本隔离。").classes("aml-sub")
+
+            def do_install() -> None:
+                target = _sanitize_version_name((name.value or "").strip()) or default_name
+                if target in self.service.installed_versions():
+                    ui.notify(f"版本名 {target} 已存在，请换一个名称", type="warning", position="top-right")
+                    return
+                self.dialog.close()
+                try:
+                    self.service.start_modpack_install(
+                        str(archive), version_id=game_version, name=target
                     )
-                else:
-                    percent = self._task_percent(snapshot)
-                    drop.busy(
-                        f"正在导入 {label}" + (f" · {percent:.0f}%" if percent > 0 else ""),
-                        percent=percent if percent > 0 else None,
-                    )
-                await asyncio.sleep(0.4)
-                continue
-            return status, str(snapshot.get("error") or "")
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"开始安装失败：{exc}", type="negative", position="top-right")
+                    return
+                self._select_view("tasks")
+                ui.notify(f"已开始安装 {target}，进度见「任务」页", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button("确认安装", icon="download", on_click=do_install).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+        self.open_dialog("确认安装整合包", builder)
 
     # ==================================================================== 任务
     def _build_tasks_page(self) -> None:

@@ -6,17 +6,21 @@ API 层与界面层都调用本类，避免逻辑重复。
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
 from engine import mirror as mirror_module
+from engine import mod_info, net, server_list, version_meta
 from engine.accounts import AccountError, AccountStore, ExternalAuthClient, SkinService, StoredAccount
 from engine.auth_client import AuthClient, AuthError, AuthResult, KeyringTokenStore
 from engine.content_manager import (
@@ -34,7 +38,7 @@ from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
 from engine.models import Account, FileEntry, GamePaths
 from engine.modpack import ModpackInstaller
-from engine.mod_provider import ModProvider, build_provider
+from engine.mod_provider import MODRINTH_API, ModProvider, build_provider
 from engine.version_resolver import VersionResolver
 
 from .config import ConfigStore, LauncherConfig
@@ -532,11 +536,14 @@ class LauncherService:
         result = []
         for version_id in sorted(self.installed_versions()):
             settings = self.config.merged_settings(version_id)
+            meta = version_meta.detect_from_meta(self.paths(), version_id) or {}
             result.append(
                 {
                     "id": version_id,
                     "isolated": bool(settings["isolated"]),
-                    "loader": _detect_loader(version_id),
+                    "loader": meta.get("loader") or _detect_loader(version_id),
+                    "game_version": meta.get("game_version") or _game_version_of(version_id),
+                    "pack_name": meta.get("pack_name") or "",
                 }
             )
         return result
@@ -545,10 +552,12 @@ class LauncherService:
         """版本的「游戏版本 + 加载器」画像，供下载页自动筛选资源。"""
         if not version_id:
             return {"id": "", "game_version": "", "loader": "vanilla"}
+        meta = version_meta.detect_from_meta(self.paths(), version_id) or {}
         return {
             "id": version_id,
-            "game_version": _game_version_of(version_id),
-            "loader": _detect_loader(version_id),
+            "game_version": meta.get("game_version") or _game_version_of(version_id),
+            "loader": meta.get("loader") or _detect_loader(version_id),
+            "loader_version": meta.get("loader_version") or "",
         }
 
     # --------------------------------------------------------- 版本级启动设置
@@ -579,43 +588,101 @@ class LauncherService:
         return self.version_settings(version_id)
 
     # ------------------------------------------------------------------ 安装
-    def start_install(self, version: str, *, include_assets: bool = True) -> Task:
+    def _download_version(
+        self, task: Task, version: str, include_assets: bool
+    ) -> None:
+        """下载某个原版版本的客户端、库与资源。"""
+        resolver = self.resolver()
+        task.log(f"解析版本 {version}（包含资源文件：{include_assets}）")
+
+        def on_phase(phase: str, done: int, total: int) -> None:
+            task.emit({"type": "phase", "phase": phase, "done": done, "total": total})
+
+        resolved = resolver.resolve(
+            version,
+            include_assets=include_assets,
+            progress=on_phase,
+            cancel=task.check_cancel,
+        )
+        task.log(f"清单解析完成，共 {len(resolved.files)} 个文件")
+
+        downloader = Downloader(
+            workers=self.config.download_workers,
+            progress=task.emit,
+        )
+        stats = downloader.download(resolved.files, cancel=task.check_cancel)
+        if stats.failed:
+            raise RuntimeError(
+                f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
+            )
+        task.log(f"原版文件就绪：下载 {stats.files_downloaded} 个，跳过 {stats.files_skipped} 个")
+
+    def start_install(
+        self,
+        version: str,
+        *,
+        include_assets: bool = True,
+        name: str = "",
+        loader: str = "",
+        loader_version: str = "",
+    ) -> Task:
+        """安装原版，可选装模组加载器，并用自定义名称创建独立版本目录。"""
+        target_name = (name or "").strip() or version
+        if Path(target_name).name != target_name or not target_name:
+            raise RuntimeError(f"版本名不合法：{target_name}")
+        loader = (loader or "").strip().lower()
+        loader_version = (loader_version or "").strip()
+        if loader not in SUPPORTED_LOADERS:
+            loader = ""
+        if not loader:
+            loader_version = ""
+
         def job(task: Task) -> None:
-            resolver = self.resolver()
-            task.log(f"解析版本 {version}（包含资源文件：{include_assets}）")
+            self._download_version(task, version, include_assets)
+            target = version
+            meta = {
+                "game_version": version,
+                "loader": "vanilla",
+                "loader_version": "",
+            }
+            if loader:
+                task.log(f"安装加载器 {loader} {loader_version}")
+                java = self.config.java
+                if loader in ("forge", "neoforge"):
+                    java = self._loader_java(task, version)
 
-            def on_phase(phase: str, done: int, total: int) -> None:
-                task.emit({"type": "phase", "phase": phase, "done": done, "total": total})
+                def on_phase(stage: str, done: int, total: int) -> None:
+                    task.emit({"type": "phase", "phase": stage, "done": done, "total": total})
 
-            resolved = resolver.resolve(
-                version,
-                include_assets=include_assets,
-                progress=on_phase,
-                cancel=task.check_cancel,
-            )
-            task.log(f"清单解析完成，共 {len(resolved.files)} 个文件")
-
-            downloader = Downloader(
-                workers=self.config.download_workers,
-                progress=task.emit,
-            )
-            stats = downloader.download(resolved.files, cancel=task.check_cancel)
-            if stats.failed:
-                raise RuntimeError(
-                    f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
+                result = LoaderInstaller(self.paths(), java=java).install(
+                    loader,
+                    version,
+                    loader_version,
+                    progress=on_phase,
+                    log=task.log,
+                    cancel=task.check_cancel,
                 )
+                self._install_version_files(task, result.version_id)
+                target = result.version_id
+                meta.update(loader=loader, loader_version=loader_version)
+
+            version_meta.write_meta(self.paths(), target, **meta)
+            if target_name != target:
+                version_meta.clone_version(self.paths(), target, target_name, meta)
+                task.log(f"已创建独立版本：{target_name}")
+                target = target_name
+
             task.result = {
                 "version": version,
-                "files": stats.files_done,
-                "downloaded": stats.files_downloaded,
-                "skipped": stats.files_skipped,
-                "bytes": stats.bytes_done,
+                "version_id": target,
+                "name": target_name,
+                "loader": loader or "vanilla",
+                "loader_version": loader_version,
             }
-            task.log(f"安装完成：下载 {stats.files_downloaded} 个，跳过 {stats.files_skipped} 个")
 
-        name = f"安装 {version}"
-        existing = self._find_active_task(name)
-        return existing or self._create_task(name, self._serialized_files(job))
+        label = f"安装 {version}" + (f" + {loader}" if loader else "")
+        existing = self._find_active_task(label)
+        return existing or self._create_task(label, self._serialized_files(job))
 
     def start_repair(self, version: str) -> Task:
         """校验并补全某个已安装版本的文件（缺失 / 损坏的 jar、库、资源）。"""
@@ -683,6 +750,22 @@ class LauncherService:
         self.log(f"已删除版本：{version_id}")
         return {"version_id": version_id, "deleted": True}
 
+    def rename_version(self, version_id: str, new_id: str) -> dict:
+        """重命名版本目录，并同步配置里的版本级设置。"""
+        new_id = (new_id or "").strip()
+        if self.has_running_game():
+            raise RuntimeError("游戏正在运行，请先结束游戏再重命名版本")
+        version_meta.rename_version(self.paths(), version_id, new_id)
+        override = self.config.version_settings.pop(version_id, None)
+        if override is not None:
+            self.config.version_settings[new_id] = override
+        if self.config.last_version == version_id:
+            self.config.last_version = new_id
+        self.store.save(self.config)
+        self._capture_storage()
+        self.log(f"版本已重命名：{version_id} → {new_id}")
+        return {"old": version_id, "new": new_id}
+
     # --------------------------------------------------------------- 加载器
     def loader_versions(self, loader: str, game_version: str) -> list[dict]:
         if loader not in SUPPORTED_LOADERS:
@@ -701,9 +784,10 @@ class LauncherService:
         ]
 
     def start_loader_install(
-        self, loader: str, game_version: str, loader_version: str
+        self, loader: str, game_version: str, loader_version: str, *, name: str = ""
     ) -> Task:
         label = f"{loader} {loader_version}"
+        target_name = (name or "").strip()
 
         def job(task: Task) -> None:
             paths = self.paths()
@@ -747,13 +831,23 @@ class LauncherService:
             )
             # 继承版本的客户端 jar / 库补齐，否则启动时 classpath 会缺文件。
             self._install_version_files(task, result.version_id)
+            meta = {
+                "game_version": game_version,
+                "loader": loader,
+                "loader_version": loader_version,
+            }
+            version_meta.write_meta(self.paths(), result.version_id, **meta)
+            target = result.version_id
+            if target_name and target_name != target:
+                version_meta.clone_version(self.paths(), target, target_name, meta)
+                target = target_name
             task.result = {
-                "version_id": result.version_id,
+                "version_id": target,
                 "loader": result.loader,
                 "loader_version": result.loader_version,
                 "game_version": result.game_version,
             }
-            task.log(f"加载器安装完成：{result.version_id}")
+            task.log(f"加载器安装完成：{target}")
 
         name = f"安装 {label}（{game_version}）"
         existing = self._find_active_task(name)
@@ -1353,8 +1447,9 @@ class LauncherService:
     def content_list(self, kind: str, version_id: Optional[str] = None) -> list[dict]:
         manager = self.content_manager()
         isolated = self._is_isolated(version_id)
-        return [
-            {
+        result = []
+        for item in manager.list_local(kind, version_id=version_id, isolated=isolated):
+            data = {
                 "kind": item.kind,
                 "filename": item.filename,
                 "path": str(item.path),
@@ -1362,8 +1457,22 @@ class LauncherService:
                 "size": item.size,
                 "modified": item.modified,
             }
-            for item in manager.list_local(kind, version_id=version_id, isolated=isolated)
-        ]
+            if kind == CONTENT_MOD:
+                info = mod_info.read_mod_info(item.path)
+                data.update(
+                    {
+                        "display_name": info.name,
+                        "mod_version": info.version,
+                        "mod_id": info.mod_id,
+                        "mod_loader": info.loader,
+                        "sha1": mod_info.cached_sha1(item.path),
+                    }
+                )
+                if info.icon:
+                    encoded = base64.b64encode(info.icon).decode("ascii")
+                    data["icon"] = f"data:image/{info.icon_ext};base64,{encoded}"
+            result.append(data)
+        return result
 
     def content_toggle(
         self, kind: str, filename: str, enabled: bool, version_id: Optional[str] = None
@@ -1411,6 +1520,88 @@ class LauncherService:
         self._capture_storage()
         return {"filename": target.name, "path": str(target)}
 
+    # ------------------------------------------------------------ Mod 更新
+    def check_mod_updates(self, version_id: str) -> dict[str, dict]:
+        """按 SHA1 反查 Modrinth，返回有更新且版本匹配的 Mod。"""
+        profile = self.version_profile(version_id)
+        game_version = profile.get("game_version") or None
+        loader = profile.get("loader")
+        loader = loader if loader not in (None, "", "vanilla", "optifine") else None
+        provider = build_provider("modrinth", timeout=10)
+        updates: dict[str, dict] = {}
+        for item in self.content_list(CONTENT_MOD, version_id):
+            sha1 = item.get("sha1")
+            if not item.get("enabled") or not sha1:
+                continue
+            try:
+                status, payload = net.get_json_auth(
+                    f"{MODRINTH_API}/version_file/{sha1}?algorithm=sha1",
+                    headers={"Accept": "application/json"},
+                    timeout=10,
+                )
+            except Exception:  # noqa: BLE001 - 单个 Mod 查询失败不影响其它
+                continue
+            if status != 200 or not isinstance(payload, dict):
+                continue
+            project_id = str(payload.get("project_id") or "")
+            current = str(payload.get("version_number") or "")
+            if not project_id:
+                continue
+            try:
+                files = provider.resolve_files(
+                    project_id, game_version=game_version, loader=loader
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            newer = next(
+                (f for f in files if f.sha1 and f.sha1.lower() != sha1.lower()), None
+            )
+            if newer is None:
+                continue
+            updates[item["filename"]] = {
+                "project_id": project_id,
+                "current_version": current,
+                "new_version": newer.version,
+                "filename": newer.filename,
+                "url": newer.url,
+                "size": newer.size,
+                "sha1": newer.sha1,
+                "game_versions": newer.game_versions,
+            }
+        return updates
+
+    def update_mod(
+        self,
+        version_id: str,
+        filename: str,
+        url: str,
+        new_filename: str,
+        *,
+        expected_sha1: str = "",
+    ) -> dict:
+        """下载新版本 Mod 并替换旧文件。"""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jar") as handle:
+            temp_path = Path(handle.name)
+        try:
+            net.download_file(url, temp_path, timeout=60)
+            if expected_sha1:
+                actual = mod_info.sha1_of(temp_path)
+                if actual.lower() != expected_sha1.lower():
+                    raise RuntimeError(f"SHA1 校验失败：{new_filename}")
+            self.content_import(
+                CONTENT_MOD,
+                str(temp_path),
+                version_id=version_id,
+                overwrite=True,
+                filename=new_filename,
+            )
+        finally:
+            temp_path.unlink(missing_ok=True)
+        if new_filename != filename:
+            self.content_delete(CONTENT_MOD, filename, version_id)
+        self.log(f"已更新 Mod：{filename} → {new_filename}")
+        return {"filename": new_filename}
+
     def list_saves(self, version_id: Optional[str] = None) -> list[dict]:
         isolated = self._is_isolated(version_id)
         return [
@@ -1427,6 +1618,97 @@ class LauncherService:
         self.log(f"删除存档：{name}")
         self._capture_storage()
         return {"name": name, "deleted": True}
+
+    def _saves_dir(self, version_id: Optional[str]) -> Path:
+        if version_id and self._is_isolated(version_id):
+            return self.paths().saves_dir_for(version_id, isolated=True)
+        return self.paths().saves_dir
+
+    def backup_save(self, name: str, version_id: Optional[str] = None) -> dict:
+        """把存档打包到 data/backups，便于手动备份。"""
+        source = self._saves_dir(version_id) / str(name)
+        if not source.is_dir():
+            raise ContentError(f"存档不存在：{name}")
+        dest_dir = self.store.data_dir / "backups"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = dest_dir / f"{name}-{stamp}.zip"
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in source.rglob("*"):
+                if item.is_file():
+                    archive.write(item, item.relative_to(source))
+        self.log(f"已备份存档：{name} → {target}")
+        return {"name": name, "path": str(target)}
+
+    def import_save(self, archive_path: str, version_id: Optional[str] = None) -> dict:
+        """从 zip 导入存档到 saves/<zip 名>。"""
+        path = Path(archive_path)
+        if not path.is_file():
+            raise ContentError(f"文件不存在：{archive_path}")
+        name = path.stem
+        target = self._saves_dir(version_id) / name
+        if target.exists():
+            raise ContentError(f"同名存档已存在：{name}")
+        target.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.infolist():
+                rel = Path(member.filename)
+                if rel.is_absolute() or ".." in rel.parts:
+                    continue
+                archive.extract(member, target)
+        self._capture_storage()
+        self.log(f"已导入存档：{name}")
+        return {"name": name, "path": str(target)}
+
+    # ------------------------------------------------------------ 服务器列表
+    def _servers_path(self, version_id: Optional[str]) -> Path:
+        if version_id:
+            base = self.paths().version_game_dir(
+                version_id, isolated=self._is_isolated(version_id)
+            )
+        else:
+            base = self.paths().root
+        return base / "servers.dat"
+
+    def list_servers(self, version_id: Optional[str] = None) -> list[dict]:
+        return server_list.load_servers(self._servers_path(version_id))
+
+    def add_server(
+        self, name: str, ip: str, version_id: Optional[str] = None
+    ) -> list[dict]:
+        address = (ip or "").strip()
+        if not address:
+            raise RuntimeError("服务器地址不能为空")
+        path = self._servers_path(version_id)
+        servers = server_list.load_servers(path)
+        servers.append({"name": (name or "").strip() or address, "ip": address})
+        server_list.save_servers(path, servers)
+        self._capture_storage()
+        self.log(f"已添加服务器：{servers[-1]['name']}（{address}）")
+        return servers
+
+    def delete_server(
+        self, index: int, version_id: Optional[str] = None
+    ) -> list[dict]:
+        path = self._servers_path(version_id)
+        servers = server_list.load_servers(path)
+        if not 0 <= int(index) < len(servers):
+            raise RuntimeError("服务器不存在")
+        removed = servers.pop(int(index))
+        server_list.save_servers(path, servers)
+        self._capture_storage()
+        self.log(f"已删除服务器：{removed.get('name') or removed.get('ip')}")
+        return servers
+
+    def open_path(self, path: str) -> None:
+        """在系统文件管理器中打开目录。"""
+        target = Path(path)
+        if not target.exists():
+            raise RuntimeError(f"路径不存在：{path}")
+        if os.name == "nt":
+            os.startfile(str(target))  # noqa: S606 - 仅本机界面操作
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
 
     def list_screenshots(self, version_id: Optional[str] = None) -> list[dict]:
         isolated = self._is_isolated(version_id)
@@ -1526,6 +1808,9 @@ class LauncherService:
             )
 
         if not loader:
+            version_meta.write_meta(
+                self.paths(), base, game_version=base, loader="vanilla"
+            )
             return base
 
         task.log(f"安装加载器 {loader} {loader_version}")
@@ -1542,6 +1827,13 @@ class LauncherService:
             cancel=task.check_cancel,
         )
         self._install_version_files(task, result.version_id)
+        version_meta.write_meta(
+            self.paths(),
+            result.version_id,
+            game_version=base,
+            loader=loader,
+            loader_version=loader_version,
+        )
         task.log(f"加载器就绪：{result.version_id}")
         return result.version_id
 
@@ -1552,8 +1844,11 @@ class LauncherService:
         self.config.set_version_override(version_id, {"isolated": True})
         self.store.save(self.config)
 
-    def start_modpack_install(self, path: str, *, version_id: str) -> Task:
+    def start_modpack_install(
+        self, path: str, *, version_id: str, name: str = ""
+    ) -> Task:
         archive = Path(path)
+        target_name = (name or "").strip()
 
         def job(task: Task) -> None:
             installer = self._modpack()
@@ -1563,6 +1858,17 @@ class LauncherService:
 
             info = installer.inspect(archive)
             target = self._prepare_modpack_version(task, info, version_id)
+            meta = {
+                "game_version": info.game_version or version_id,
+                "loader": info.loader if info.loader in SUPPORTED_LOADERS else "vanilla",
+                "loader_version": info.loader_version or "",
+                "pack_name": info.name,
+            }
+            version_meta.write_meta(self.paths(), target, **meta)
+            if target_name and target_name != target:
+                version_meta.clone_version(self.paths(), target, target_name, meta)
+                task.log(f"整合包版本命名：{target_name}")
+                target = target_name
             self._mark_modpack_isolated(target)
             info = installer.install(
                 archive,
@@ -1579,9 +1885,9 @@ class LauncherService:
             }
             task.log(f"整合包导入完成：{info.name} → {target}")
 
-        name = f"导入整合包 {archive.name}"
-        existing = self._find_active_task(name)
-        return existing or self._create_task(name, self._serialized_modpack(job))
+        label = f"导入整合包 {archive.name}"
+        existing = self._find_active_task(label)
+        return existing or self._create_task(label, self._serialized_modpack(job))
 
     def export_modpack(
         self,
@@ -1620,6 +1926,7 @@ class LauncherService:
         *,
         name: str = "",
         version_id: Optional[str] = None,
+        version_name: str = "",
     ) -> Task:
         """下载在线整合包并按包内游戏版本直接安装（不做版本/加载器筛选）。"""
         label = name or project_id
@@ -1660,6 +1967,17 @@ class LauncherService:
             installer = self._modpack()
             info = installer.inspect(entry.target_path)
             target = self._prepare_modpack_version(task, info, version_id or "")
+            meta = {
+                "game_version": info.game_version or (version_id or ""),
+                "loader": info.loader if info.loader in SUPPORTED_LOADERS else "vanilla",
+                "loader_version": info.loader_version or "",
+                "pack_name": info.name,
+            }
+            version_meta.write_meta(self.paths(), target, **meta)
+            wanted = (version_name or "").strip()
+            if wanted and wanted != target:
+                version_meta.clone_version(self.paths(), target, wanted, meta)
+                target = wanted
             self._mark_modpack_isolated(target)
 
             def on_progress(stage: str, done: int, total: int) -> None:
