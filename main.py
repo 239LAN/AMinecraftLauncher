@@ -25,7 +25,7 @@ from app.config import ConfigStore, runtime_dir
 from app.secrets import SecretStore
 from app.services import LauncherService
 from app.tasks import TaskManager
-from app.ui import setup_pages
+from app.ui import native_maximize_guard, setup_pages
 from engine.version import APP_NAME, APP_VERSION
 
 
@@ -97,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
         app.native.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
         app.native.window_args["min_size"] = (880, 576)  # 与 1100x720 同比例
         app.native.window_args["easy_drag"] = False  # 仅允许在拖动区域拖动窗口
+        # 窗口运行在 NiceGUI 的子进程里，最大化范围只能在那里设置：
+        # 否则无边框窗口最大化会盖住任务栏。
+        app.native.start_args["func"] = native_maximize_guard
 
     ui.run(**run_kwargs)
     return 0

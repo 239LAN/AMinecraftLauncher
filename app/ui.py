@@ -604,6 +604,53 @@ class ImportDrop:
         self.fill.style("width: 0%")
 
 
+def native_maximize_guard() -> None:
+    """无边框窗口最大化时会盖住任务栏，这里把最大化范围限制在屏幕工作区。
+
+    NiceGUI 原生模式的窗口运行在独立子进程，主进程只拿到代理对象，
+    因此必须通过 pywebview.start(func=...) 在这个进程里操作真实窗体。
+    """
+    try:
+        import clr
+
+        clr.AddReference("System.Windows.Forms")
+        import webview
+        from System import Func, Type
+        from System.Windows.Forms import Screen
+    except Exception:  # noqa: BLE001 - 非 Windows / 缺少 pythonnet 时直接跳过
+        return
+
+    windows = []
+    form = None
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        windows = getattr(webview, "windows", None) or []
+        if windows:
+            form = getattr(windows[0], "native", None)
+            if form is not None:
+                break
+        time.sleep(0.1)
+    if form is None:
+        return
+
+    def _limit() -> None:
+        form.MaximizedBounds = Screen.FromControl(form).WorkingArea
+
+    def _refresh(*_args) -> None:
+        try:
+            _limit()
+        except Exception:  # noqa: BLE001 - 窗体销毁期间忽略
+            return
+
+    try:
+        form.Invoke(Func[Type](_limit))
+        # 窗口换到另一块屏幕时，重新按那块屏幕的工作区限制最大化范围。
+        windows[0].events.moved += _refresh
+        windows[0].events.restored += _refresh
+    except Exception:  # noqa: BLE001 - 安装失败时退回系统默认行为
+        return
+
+
 class LauncherUI:
     def __init__(self, service: LauncherService, *, debug: bool = False) -> None:
         self.service = service
@@ -722,29 +769,8 @@ class LauncherUI:
             window.restore()
             self._is_maximized = False
         else:
-            self._limit_maximize_to_work_area(window)
             window.maximize()
             self._is_maximized = True
-
-    @staticmethod
-    def _limit_maximize_to_work_area(window) -> None:
-        """无边框窗口最大化会盖住任务栏，这里把最大化范围限制在当前屏幕工作区。"""
-        form = getattr(window, "native", None)
-        if form is None:
-            return
-        try:
-            import clr
-
-            clr.AddReference("System.Windows.Forms")
-            from System import Func, Type
-            from System.Windows.Forms import Screen
-
-            def _apply() -> None:
-                form.MaximizedBounds = Screen.FromControl(form).WorkingArea
-
-            form.Invoke(Func[Type](_apply))
-        except Exception:  # noqa: BLE001 - 环境差异时退回默认最大化
-            return
 
     def _win_close(self) -> None:
         if self._native_window() is None:
