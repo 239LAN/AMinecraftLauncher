@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -31,6 +32,19 @@ NAV_ITEMS = [
 
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
+    {
+        "version": "1.4.0",
+        "title": "内容管理 · 自动更新",
+        "notes": """\
+- 版本页新增资源包与光影管理：支持批量导入、启用 / 禁用、删除与打开目录
+- 新增截图管理：缩略图预览、打开目录与删除截图，版本隔离时读取对应版本目录
+- Mod 开始下载后自动检查必装前置，缺失时弹窗列出并可一键安装
+- 新增启动器自动更新：启动时静默检查 GitHub Release，下载优先走公共 GH 代理，失败回退直连；下载完成后可重启替换并自动打开新版本
+- 新增运行日志查看：支持关键字筛选、刷新、导出与打开日志目录，日志同时落盘到 data/logs/launcher.log
+- 启动页新增微软正版登录：设备码授权后自动轮询完成登录，支持复制设备码与打开浏览器
+- 移除标题栏左侧应用图标；设置中移除设备码 / 微软客户端 ID 配置项
+""",
+    },
     {
         "version": "1.3.1",
         "title": "图标重绘",
@@ -225,11 +239,6 @@ body {
   background: var(--aml-surface);
   border-bottom: 1px solid var(--aml-border);
 }
-.aml-logo {
-  width: 40px; height: 40px; border-radius: 3px; overflow: hidden;
-  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-}
-.aml-logo img { width: 100%; height: 100%; display: block; }
 .aml-topnav {
   display: flex; align-items: center; gap: 6px; padding: 6px 12px;
   border-radius: 999px; cursor: pointer; color: #4b5563;
@@ -817,14 +826,14 @@ class LauncherUI:
             ui.timer(1.0, self._refresh_logs)
         ui.timer(0.5, self._poll_tasks)
         self._select_view("home")
+        # 启动后静默检查一次更新；不阻塞启动，也避免频繁请求。
+        ui.timer(2.0, self._silent_update_check, once=True)
 
     def _build_topbar(self) -> None:
         with ui.row().classes(
             "aml-topbar w-full h-[56px] shrink-0 items-center no-wrap px-4 gap-2"
         ):
             with ui.row().classes("items-center gap-2.5 no-wrap shrink-0"):
-                with ui.element("div").classes("aml-logo"):
-                    ui.image("/aml-assets/aml.png")
                 with ui.column().classes("gap-0 no-wrap").style("line-height: 1.15"):
                     ui.label(APP_NAME).classes("text-[14px] font-semibold")
                     ui.label(f"v{APP_VERSION}").classes("text-[10px]").style(
@@ -1207,7 +1216,9 @@ class LauncherUI:
             if account:
                 ui.label(account["name"]).classes("text-[18px] font-semibold")
                 with ui.row().classes("items-center gap-2 no-wrap"):
-                    ui.label("离线登录").classes("aml-chip")
+                    ui.label(
+                        "正版登录" if account.get("kind") == "microsoft" else "离线登录"
+                    ).classes("aml-chip")
                     ui.button("退出登录", on_click=self._logout_home).props(
                         "flat dense no-caps"
                     ).classes("aml-sub")
@@ -1218,10 +1229,13 @@ class LauncherUI:
                 self.home_name.on(
                     "keydown.enter", lambda: background_tasks.create(self._home_login())
                 )
-                ui.button("登录", icon="login", on_click=self._home_login).classes(
+                ui.button("离线登录", icon="login", on_click=self._home_login).classes(
                     "w-[220px]"
                 ).props("unelevated dense no-caps color=primary")
-                ui.label("暂支持离线登录").classes("aml-sub")
+                ui.button(
+                    "正版登录", icon="verified_user", on_click=self._home_ms_login
+                ).classes("w-[220px]").props("outline dense no-caps color=primary")
+                ui.label("使用微软账号登录更安全").classes("aml-sub")
 
     def _render_avatar(self, account: Optional[dict]) -> None:
         url = ""
@@ -1254,6 +1268,80 @@ class LauncherUI:
             return
         ui.notify(f"已登录：{name}", type="positive", position="top-right")
         self._refresh_home()
+
+    async def _home_ms_login(self) -> None:
+        """微软正版登录：设备码授权 + 定时轮询。"""
+        if getattr(self, "_ms_login_open", False):
+            ui.notify("正版登录窗口已打开，请在浏览器完成授权", type="warning", position="top-right")
+            return
+        try:
+            info = await run.io_bound(self.service.auth_start)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"申请设备码失败：{exc}", type="negative", position="top-right")
+            return
+
+        self._ms_login_open = True
+        started = time.monotonic()
+        timer_holder: dict = {}
+
+        def stop() -> None:
+            active = timer_holder.get("timer")
+            if active is not None:
+                active.active = False
+            self._ms_login_open = False
+
+        def cancel() -> None:
+            stop()
+            self.dialog.close()
+
+        def builder() -> None:
+            ui.label("微软账号登录").classes("text-[16px] font-semibold")
+            ui.label("1. 打开下面的网址　2. 输入设备码并完成授权").classes("aml-sub")
+            ui.label(info["verification_uri"]).classes("text-[13px] select-all")
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.label(info["user_code"]).classes("text-[22px] font-semibold").style(
+                    "font-family: Consolas, monospace; letter-spacing: 2px"
+                )
+                ui.button(
+                    "复制设备码", icon="content_copy",
+                    on_click=lambda: (
+                        ui.clipboard.write(info["user_code"]),
+                        ui.notify("设备码已复制", position="top-right"),
+                    ),
+                ).props("flat dense no-caps")
+            status = ui.label("等待浏览器授权…").classes("aml-sub")
+
+            async def poll() -> None:
+                if time.monotonic() - started > float(info.get("expires_in") or 900):
+                    status.text = "设备码已过期，请重新发起登录"
+                    stop()
+                    return
+                try:
+                    result = await run.io_bound(
+                        self.service.auth_poll, info["device_code"]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    status.text = f"登录失败：{exc}"
+                    stop()
+                    return
+                if result.get("status") == "ok":
+                    stop()
+                    self.dialog.close()
+                    name = (result.get("stored") or {}).get("name") or "微软账号"
+                    ui.notify(f"正版登录成功：{name}", type="positive", position="top-right")
+                    self._refresh_home()
+
+            with ui.row().classes("w-full justify-between items-center no-wrap"):
+                ui.button(
+                    "打开浏览器", icon="open_in_new",
+                    on_click=lambda: webbrowser.open(info["verification_uri"]),
+                ).props("flat dense no-caps")
+                ui.button("取消", on_click=cancel).props("flat dense no-caps")
+            timer_holder["timer"] = ui.timer(
+                max(5, int(info.get("interval") or 5)), poll
+            )
+
+        self.open_dialog("正版登录", builder)
 
     async def _logout_home(self) -> None:
         account = self._active_account()
@@ -1600,7 +1688,10 @@ class LauncherUI:
             ui.toggle(
                 {
                     "mods": "Mod 管理",
+                    "resourcepacks": "资源包",
+                    "shaders": "光影",
                     "saves": "存档",
+                    "screenshots": "截图",
                     "servers": "服务器",
                     "settings": "版本设置",
                 },
@@ -1609,13 +1700,22 @@ class LauncherUI:
             ).props("unelevated dense no-caps toggle-color=primary").classes("self-start")
 
             mods_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-mods")
+            resourcepacks_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-resourcepacks")
+            shaders_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-shaders")
             saves_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-saves")
+            screenshots_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-screenshots")
             servers_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-servers")
             settings_box = ui.column().classes("w-full gap-3").props("id=aml-vtab-settings")
             with mods_box:
                 self._build_version_mods(version_id)
+            with resourcepacks_box:
+                self._build_version_contents("resourcepack", version_id)
+            with shaders_box:
+                self._build_version_contents("shader", version_id)
             with saves_box:
                 self._build_version_saves(version_id)
+            with screenshots_box:
+                self._build_version_screenshots(version_id)
             with servers_box:
                 self._build_version_servers(version_id)
             with settings_box:
@@ -1626,7 +1726,10 @@ class LauncherUI:
 
         self.version_tab_boxes = {
             "mods": mods_box,
+            "resourcepacks": resourcepacks_box,
+            "shaders": shaders_box,
             "saves": saves_box,
+            "screenshots": screenshots_box,
             "servers": servers_box,
             "settings": settings_box,
         }
@@ -1938,6 +2041,273 @@ class LauncherUI:
             return
         ui.notify(f"已删除 {filename}", position="top-right")
         reload_mods()
+
+    # ------------------------------------------------- 版本：资源包 / 光影
+    def _build_version_contents(self, kind: str, version_id: str) -> None:
+        label = CONTENT_LABELS.get(kind, kind)
+        isolated = self.service._is_isolated(version_id)
+        directory = self.service.content_manager().dir_for(
+            kind, version_id=version_id, isolated=isolated
+        )
+        safe_id = "".join(ch if ch.isalnum() else "-" for ch in version_id)
+        content_box = None
+
+        async def refresh_contents() -> None:
+            content_box.clear()
+            with content_box:
+                with ui.row().classes("w-full items-center justify-center p-4"):
+                    ui.spinner(size="sm").style("color: var(--aml-accent)")
+            try:
+                items = await run.io_bound(self.service.content_list, kind, version_id)
+            except Exception as exc:  # noqa: BLE001
+                items = []
+                ui.notify(f"读取{label}失败：{exc}", type="negative", position="top-right")
+            content_box.clear()
+            with content_box:
+                if not items:
+                    ui.label(f"暂无{label}").classes("aml-sub")
+                for item in items:
+                    self._content_row(kind, version_id, item, reload_contents)
+
+        def reload_contents() -> None:
+            background_tasks.create(refresh_contents())
+
+        async def on_content_files(event) -> None:
+            files = list(getattr(event, "files", []) or [])
+            total = len(files)
+            if not total:
+                return
+            done = 0
+            added = 0
+            errors: list[str] = []
+            drop.busy(f"正在导入 0/{total}…", percent=0)
+            for file in files:
+                filename = Path(file.name).name
+                done += 1
+                if Path(filename).suffix.lower() != ".zip":
+                    errors.append(f"{filename} 不是 .zip")
+                    continue
+                drop.busy(
+                    f"正在导入 {done}/{total}：{filename}", percent=(done - 1) / total * 100
+                )
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as handle:
+                    temp_path = Path(handle.name)
+                try:
+                    await self._save_upload(file, temp_path)
+                    await run.io_bound(
+                        self.service.content_import, kind, str(temp_path),
+                        version_id=version_id, overwrite=True, filename=filename,
+                    )
+                    added += 1
+                except Exception as exc:  # noqa: BLE001 - 单个失败不影响其它文件
+                    errors.append(f"{filename}：{exc}")
+                finally:
+                    temp_path.unlink(missing_ok=True)
+                drop.busy(f"正在导入 {done}/{total}…", percent=done / total * 100)
+            drop.idle()
+            reload_contents()
+            if added:
+                ui.notify(f"已添加 {added} 个{label}", type="positive", position="top-right")
+            if errors:
+                ui.notify("；".join(errors[:3]), type="negative", position="top-right")
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label(f"{label}管理").classes("text-[14px] font-semibold")
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button(
+                        "打开目录", icon="folder_open",
+                        on_click=lambda: self._open_content_dir(kind, version_id),
+                    ).props("flat dense no-caps")
+                    ui.button("刷新", icon="refresh", on_click=reload_contents).props(
+                        "flat dense no-caps"
+                    )
+            ui.label(f"目录：{directory}").classes("aml-sub")
+            drop = ImportDrop(
+                upload_id=f"aml-{kind}-upload-{safe_id}",
+                hint=f"点击选择或拖入{label}（.zip，可多选）",
+                handler=on_content_files,
+            ).build()
+            content_box = ui.column().classes("w-full gap-1")
+
+        background_tasks.create(refresh_contents())
+
+    def _content_row(
+        self, kind: str, version_id: str, item: dict, reload_contents: Callable[[], None]
+    ) -> None:
+        icon = "palette" if kind == "resourcepack" else "auto_awesome"
+        with ui.row().classes(
+            "w-full items-center gap-3 no-wrap px-2 py-2 rounded-lg"
+        ).style("background: var(--aml-surface-2)"):
+            with ui.element("div").classes(
+                "w-[36px] h-[36px] rounded-md flex items-center justify-center shrink-0"
+            ).style("background: #eef0f3"):
+                ui.icon(icon).classes("text-[20px]").style("color: var(--aml-muted)")
+            with ui.column().classes("flex-1 min-w-0 gap-0.5"):
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.label(item["filename"]).classes("text-[13px] font-medium truncate")
+                    ui.label("已启用" if item["enabled"] else "已禁用").classes(
+                        "aml-chip installed" if item["enabled"] else "aml-chip"
+                    )
+                ui.label(_fmt_size(item.get("size") or 0)).classes("aml-sub")
+            with ui.row().classes("gap-1 shrink-0 no-wrap"):
+                ui.button(
+                    "禁用" if item["enabled"] else "启用",
+                    on_click=lambda _=None, i=item: self._toggle_content(
+                        kind, version_id, i, reload_contents
+                    ),
+                ).props("flat dense no-caps")
+                ui.button(
+                    "删除",
+                    on_click=lambda _=None, i=item: self._delete_content(
+                        kind, version_id, i["filename"], reload_contents
+                    ),
+                ).props("flat dense no-caps color=negative")
+
+    def _open_content_dir(self, kind: str, version_id: str) -> None:
+        isolated = self.service._is_isolated(version_id)
+        directory = self.service.content_manager().dir_for(
+            kind, version_id=version_id, isolated=isolated
+        )
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            self.service.open_path(str(directory))
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"打开目录失败：{exc}", type="negative", position="top-right")
+
+    def _toggle_content(
+        self, kind: str, version_id: str, item: dict, reload_contents: Callable[[], None]
+    ) -> None:
+        try:
+            self.service.content_toggle(kind, item["filename"], not item["enabled"], version_id)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"操作失败：{exc}", type="negative", position="top-right")
+            return
+        reload_contents()
+
+    def _delete_content(
+        self,
+        kind: str,
+        version_id: str,
+        filename: str,
+        reload_contents: Callable[[], None],
+    ) -> None:
+        try:
+            self.service.content_delete(kind, filename, version_id)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"删除失败：{exc}", type="negative", position="top-right")
+            return
+        ui.notify(f"已删除 {filename}", position="top-right")
+        reload_contents()
+
+    # ------------------------------------------------------------ 版本：截图
+    def _build_version_screenshots(self, version_id: str) -> None:
+        shot_box = None
+
+        async def refresh_shots() -> None:
+            shot_box.clear()
+            with shot_box:
+                with ui.row().classes("w-full items-center justify-center p-4"):
+                    ui.spinner(size="sm").style("color: var(--aml-accent)")
+            try:
+                shots = await run.io_bound(self.service.list_screenshots, version_id)
+            except Exception as exc:  # noqa: BLE001
+                shots = []
+                ui.notify(f"读取截图失败：{exc}", type="negative", position="top-right")
+            shot_box.clear()
+            with shot_box:
+                if not shots:
+                    ui.label("暂无截图").classes("aml-sub")
+                with ui.element("div").classes("w-full grid grid-cols-3 gap-2"):
+                    for shot in shots:
+                        self._screenshot_card(version_id, shot, reload_shots)
+
+        def reload_shots() -> None:
+            background_tasks.create(refresh_shots())
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label("截图管理").classes("text-[14px] font-semibold")
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button(
+                        "打开目录", icon="folder_open",
+                        on_click=lambda: self._open_screenshots_dir(version_id),
+                    ).props("flat dense no-caps")
+                    ui.button("刷新", icon="refresh", on_click=reload_shots).props(
+                        "flat dense no-caps"
+                    )
+            ui.label("游戏内按 F2 截图会保存在该目录").classes("aml-sub")
+            shot_box = ui.column().classes("w-full gap-2")
+
+        background_tasks.create(refresh_shots())
+
+    def _screenshot_url(self, path: str) -> str:
+        cache = getattr(self, "_screenshot_urls", None)
+        if cache is None:
+            cache = {}
+            self._screenshot_urls = cache
+        if path not in cache:
+            try:
+                cache[path] = app.add_static_file(local_file=path, max_cache_age=0)
+            except Exception:  # noqa: BLE001 - 缩略图不可用时退化为图标
+                cache[path] = ""
+        return cache[path]
+
+    def _screenshot_card(
+        self, version_id: str, shot: dict, reload_shots: Callable[[], None]
+    ) -> None:
+        with ui.column().classes("aml-card flat p-2 gap-1 min-w-0"):
+            url = self._screenshot_url(str(shot["path"]))
+            if url:
+                ui.image(url).props("fit=cover").classes("w-full h-[110px] rounded-md")
+            else:
+                with ui.element("div").classes(
+                    "w-full h-[110px] rounded-md flex items-center justify-center"
+                ).style("background: #eef0f3"):
+                    ui.icon("image").classes("text-[32px]").style("color: var(--aml-muted)")
+            with ui.row().classes("w-full items-center justify-between no-wrap gap-1"):
+                with ui.column().classes("min-w-0 gap-0"):
+                    ui.label(shot["name"]).classes("text-[12px] truncate")
+                    ui.label(_fmt_size(shot.get("size") or 0)).classes("aml-sub")
+                ui.button(
+                    icon="delete",
+                    on_click=lambda _=None, s=shot: self._confirm_delete_screenshot(
+                        version_id, s, reload_shots
+                    ),
+                ).props("flat dense round size=sm color=negative")
+
+    def _open_screenshots_dir(self, version_id: str) -> None:
+        path = self.service.screenshots_dir(version_id)
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            self.service.open_path(path)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"打开目录失败：{exc}", type="negative", position="top-right")
+
+    def _confirm_delete_screenshot(
+        self, version_id: str, shot: dict, reload_shots: Callable[[], None]
+    ) -> None:
+        def builder() -> None:
+            ui.label(f"确定删除截图 {shot['name']}？").classes("text-[15px] font-semibold")
+            ui.label("图片文件会被永久删除。").classes("aml-sub")
+
+            async def do_delete() -> None:
+                try:
+                    await run.io_bound(
+                        self.service.delete_screenshot, shot["name"], version_id
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"删除失败：{exc}", type="negative", position="top-right")
+                    return
+                self.dialog.close()
+                reload_shots()
+                ui.notify("截图已删除", position="top-right")
+
+            ui.button("确认删除", icon="delete", on_click=do_delete).props(
+                "unelevated dense no-caps color=negative"
+            )
+
+        self.open_dialog("删除截图", builder)
 
     # ------------------------------------------------------------ 版本：存档
     def _build_version_saves(self, version_id: str) -> None:
@@ -2744,6 +3114,94 @@ class LauncherUI:
         )
         self._select_view("tasks")
         ui.notify(f"已开始下载 {item['name']}，进度见「任务」页", position="top-right")
+        if kind == "mod":
+            background_tasks.create(
+                self._prompt_mod_dependencies(item, game_version, loader, version_id)
+            )
+
+    async def _prompt_mod_dependencies(
+        self,
+        item: dict,
+        game_version: Optional[str],
+        loader: Optional[str],
+        version_id: Optional[str],
+    ) -> None:
+        """下载开始后检查前置 Mod，缺失时弹窗提供一键安装。"""
+        try:
+            deps = await run.io_bound(
+                lambda: self.service.mod_dependencies(
+                    item["source"],
+                    item["project_id"],
+                    game_version=game_version,
+                    loader=loader,
+                )
+            )
+            installed = {
+                str(entry.get("filename") or "").lower()
+                for entry in await run.io_bound(self.service.content_list, "mod", version_id)
+            }
+        except Exception:  # noqa: BLE001 - 依赖查询失败不阻塞主下载
+            return
+        missing = [
+            dep
+            for dep in deps
+            if str(dep.get("filename") or "").lower() not in installed
+        ]
+        if not missing:
+            return
+
+        def builder() -> None:
+            ui.label(f"{item['name']} 需要以下前置 Mod").classes("text-[15px] font-semibold")
+            ui.label("已自动匹配当前游戏版本与加载器；一键安装会下载并放入 mods 目录。").classes(
+                "aml-sub"
+            )
+            with ui.column().classes("w-full gap-1"):
+                for dep in missing:
+                    with ui.row().classes(
+                        "w-full items-center gap-2 no-wrap px-2 py-1.5 rounded-lg"
+                    ).style("background: var(--aml-surface-2)"):
+                        if dep.get("icon_url"):
+                            ui.image(dep["icon_url"]).classes(
+                                "w-[28px] h-[28px] rounded-md shrink-0 object-cover"
+                            )
+                        else:
+                            ui.icon("extension").classes("text-[20px] shrink-0").style(
+                                "color: var(--aml-muted)"
+                            )
+                        ui.label(dep["name"]).classes("text-[13px] flex-1 truncate")
+                        ui.label(
+                            "CurseForge" if dep["source"] == "curseforge" else "Modrinth"
+                        ).classes("aml-chip")
+
+            async def install_all() -> None:
+                errors: list[str] = []
+                for dep in missing:
+                    try:
+                        self.service.start_content_install(
+                            "mod",
+                            dep["source"],
+                            dep["project_id"],
+                            name=dep["name"],
+                            game_version=game_version,
+                            loader=loader,
+                            version_id=version_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{dep['name']}：{exc}")
+                self.dialog.close()
+                self._select_view("tasks")
+                if errors:
+                    ui.notify("；".join(errors[:3]), type="negative", position="top-right")
+                else:
+                    ui.notify(f"已开始安装 {len(missing)} 个前置 Mod", position="top-right")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("跳过", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button("一键安装前置", icon="download", on_click=install_all).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+        self.open_dialog("安装前置 Mod", builder)
 
     # ------------------------------------------------------------ 下载：整合包
     def _build_modpack_download(self) -> None:
@@ -3358,10 +3816,33 @@ class LauncherUI:
             ).classes("aml-sub")
 
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
-            ui.label("账号").classes("text-[14px] font-semibold")
-            self.set_client_id = ui.input(
-                label="微软客户端 ID", value=view["client_id"]
-            ).classes("w-full").props("dense outlined")
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                with ui.column().classes("gap-0"):
+                    ui.label("启动器更新").classes("text-[14px] font-semibold")
+                    ui.label(
+                        f"当前 v{APP_VERSION} · 启动时自动检查，下载优先走公共 GH 代理"
+                    ).classes("aml-sub")
+                ui.button(
+                    "检查更新", icon="system_update_alt",
+                    on_click=lambda: background_tasks.create(self._check_update(True)),
+                ).props("flat dense no-caps")
+            self.update_hint = ui.label("启动时会在后台自动检查更新").classes("aml-sub")
+
+        with ui.column().classes("aml-card flat w-full p-4 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                with ui.column().classes("gap-0"):
+                    ui.label("运行日志").classes("text-[14px] font-semibold")
+                    ui.label("记录启动、下载与安装过程，保存在 data/logs/launcher.log").classes(
+                        "aml-sub"
+                    )
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button(
+                        "打开目录", icon="folder_open",
+                        on_click=lambda: self._open_logs_dir(),
+                    ).props("flat dense no-caps")
+                    ui.button(
+                        "查看日志", icon="receipt_long", on_click=self._open_logs_dialog
+                    ).props("unelevated dense no-caps color=primary")
 
         ui.button("保存启动器设置", icon="save", on_click=self._save_launcher_settings).props(
             "unelevated dense no-caps color=primary"
@@ -3405,17 +3886,12 @@ class LauncherUI:
         ).classes("self-start")
 
     async def _save_launcher_settings(self) -> None:
-        client_id = (self.set_client_id.value or "").strip()
-        if not client_id:
-            ui.notify("微软客户端 ID 不能为空", type="warning", position="top-right")
-            return
         changes = {
             "download_source": "auto" if self.set_mirror.value else "official",
             "download_workers": int(self.set_workers.value or 32),
             "mod_source": self.set_mod_source.value,
             "mod_loader": self.set_mod_loader.value,
             "include_snapshots": bool(self.set_include_snapshots.value),
-            "client_id": client_id,
         }
         try:
             view = await run.io_bound(self.service.update_config, changes)
@@ -3430,6 +3906,238 @@ class LauncherUI:
             self.snapshot_switch.value = bool(self.service.config.include_snapshots)
             self.snapshot_switch.update()
         ui.notify("启动器设置已保存", type="positive", position="top-right")
+
+    # ---------------------------------------------------------- 更新与日志
+    def _silent_update_check(self) -> None:
+        background_tasks.create(self._check_update(False))
+
+    async def _check_update(self, manual: bool) -> dict:
+        if getattr(self, "_update_checking", False):
+            return {}
+        self._update_checking = True
+        hint = getattr(self, "update_hint", None)
+        if hint is not None:
+            hint.text = "正在检查更新…"
+        try:
+            info = await run.io_bound(self.service.check_launcher_update)
+        except Exception as exc:  # noqa: BLE001
+            if hint is not None:
+                hint.text = f"检查更新失败：{exc}"
+            if manual:
+                ui.notify(f"检查更新失败：{exc}", type="negative", position="top-right")
+            return {}
+        finally:
+            self._update_checking = False
+
+        self._update_info = info
+        if info.get("available"):
+            if hint is not None:
+                hint.text = f"发现新版本 v{info['version']}（当前 v{APP_VERSION}）"
+            if manual:
+                self._open_update_dialog(info)
+            else:
+                ui.notify(
+                    f"发现新版本 v{info['version']}，可在「设置 → 启动器更新」查看",
+                    type="info",
+                    position="top-right",
+                )
+        else:
+            if hint is not None:
+                hint.text = f"已是最新版本（v{APP_VERSION}）"
+            if manual:
+                ui.notify("已是最新版本", type="positive", position="top-right")
+        return info
+
+    def _open_update_dialog(self, info: dict) -> None:
+        def builder() -> None:
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.label(f"v{info.get('version')}").classes("text-[18px] font-semibold")
+                ui.label("新版本可用").classes("aml-chip installed")
+            ui.label(
+                f"当前版本 v{APP_VERSION} · 安装包 {_fmt_size(info.get('size') or 0)}"
+            ).classes("aml-sub")
+            notes = (info.get("notes") or "").strip()
+            if notes:
+                ui.label(notes).classes("text-[12.5px]").style(
+                    "white-space: pre-wrap; max-height: 220px; overflow-y: auto; "
+                    "background: var(--aml-surface-2); border-radius: 10px; padding: 8px 10px;"
+                )
+            ui.label("下载优先使用公共 GH 代理，失败时自动回退 GitHub 原始地址。").classes(
+                "aml-sub"
+            )
+
+            def start() -> None:
+                self.dialog.close()
+                self._open_update_progress(info)
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("稍后", on_click=self.dialog.close).props("flat dense no-caps")
+                if info.get("frozen"):
+                    ui.button(
+                        "下载并安装", icon="system_update_alt", on_click=start
+                    ).props("unelevated dense no-caps color=primary")
+                else:
+                    ui.button(
+                        "下载到本地", icon="download", on_click=start
+                    ).props("unelevated dense no-caps color=primary")
+
+        self.open_dialog("启动器更新", builder)
+
+    def _open_update_progress(self, info: dict) -> None:
+        state = {"done": 0, "total": int(info.get("size") or 0), "path": "", "error": ""}
+        cancel = threading.Event()
+        timer_ref: dict = {}
+
+        def on_chunk(delta: int) -> None:
+            state["done"] = max(0, state["done"] + int(delta))
+
+        def cancel_download() -> None:
+            cancel.set()
+            active = timer_ref.get("timer")
+            if active is not None:
+                active.active = False
+            self.dialog.close()
+
+        def builder() -> None:
+            ui.label(f"正在下载 v{info.get('version')}…").classes("text-[14px] font-semibold")
+            bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
+            detail = ui.label("0%").classes("aml-sub")
+            with ui.row().classes("w-full justify-between items-center no-wrap"):
+                ui.label("下载完成后可立即重启并替换程序").classes("aml-sub")
+                ui.button("取消", on_click=cancel_download).props("flat dense no-caps")
+
+            async def job() -> None:
+                try:
+                    result = await run.io_bound(
+                        lambda: self.service.download_launcher_update(
+                            info, on_chunk=on_chunk, cancel=cancel.is_set
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    state["error"] = str(exc)
+                    return
+                state["path"] = result["path"]
+                if state["total"]:
+                    state["done"] = state["total"]
+
+            def stop_timer() -> None:
+                active = timer_ref.get("timer")
+                if active is not None:
+                    active.active = False
+
+            def tick() -> None:
+                total = state["total"]
+                done = state["done"]
+                percent = (done / total * 100) if total else 0.0
+                bar.value = min(1.0, percent / 100)
+                detail.text = f"{percent:.1f}% · {_fmt_size(done)} / {_fmt_size(total)}"
+                if cancel.is_set():
+                    stop_timer()
+                    return
+                if state["error"]:
+                    stop_timer()
+                    self.dialog.close()
+                    ui.notify(
+                        f"下载更新失败：{state['error']}", type="negative", position="top-right"
+                    )
+                elif state["path"]:
+                    stop_timer()
+                    self.dialog.close()
+                    if info.get("frozen"):
+                        self._confirm_apply_update(state["path"], info)
+                    else:
+                        ui.notify(
+                            f"更新已下载到 {state['path']}（源码模式不会替换程序）",
+                            type="positive",
+                            position="top-right",
+                        )
+
+            ui.timer(0.1, job, once=True)
+            timer_ref["timer"] = ui.timer(0.2, tick)
+
+        self.open_dialog(f"下载更新 v{info.get('version')}", builder)
+
+    def _confirm_apply_update(self, path: str, info: dict) -> None:
+        def builder() -> None:
+            ui.label(f"v{info.get('version')} 已下载完成").classes("text-[15px] font-semibold")
+            ui.label("立即关闭启动器，替换程序文件后自动重启？").classes("aml-sub")
+
+            async def apply() -> None:
+                self.dialog.close()
+                try:
+                    await run.io_bound(self.service.apply_launcher_update, path)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"启动更新失败：{exc}", type="negative", position="top-right")
+                    return
+                ui.notify("正在重启并安装更新…", position="top-right")
+                ui.timer(0.6, app.shutdown, once=True)
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("稍后", on_click=self.dialog.close).props("flat dense no-caps")
+                ui.button(
+                    "立即重启安装", icon="restart_alt", on_click=apply
+                ).props("unelevated dense no-caps color=primary")
+
+        self.open_dialog("安装更新", builder)
+
+    def _open_logs_dir(self) -> None:
+        try:
+            self.service.open_path(self.service.logs_dir())
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"打开日志目录失败：{exc}", type="negative", position="top-right")
+
+    def _open_logs_dialog(self) -> None:
+        def builder() -> None:
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                keyword = ui.input(placeholder="筛选关键字").props("dense outlined").classes(
+                    "flex-1"
+                )
+            log_holder = ui.column().classes("w-full")
+
+            async def refresh() -> None:
+                lines = await run.io_bound(
+                    self.service.launcher_logs,
+                    limit=500,
+                    keyword=keyword.value or "",
+                )
+                log_holder.clear()
+                with log_holder:
+                    log_view = ui.log(max_lines=1000).classes("w-full").style(
+                        "height: 340px; font-family: Consolas, 'Courier New', monospace; "
+                        "font-size: 12px; background: #0f172a; color: #e2e8f0; "
+                        "border-radius: 10px; padding: 8px;"
+                    )
+                    if not lines:
+                        log_view.push("（暂无日志）")
+                    for line in lines:
+                        log_view.push(line)
+
+            async def export() -> None:
+                lines = await run.io_bound(
+                    self.service.launcher_logs,
+                    limit=100000,
+                    keyword=keyword.value or "",
+                )
+                result = await run.io_bound(self.service.export_launcher_logs, lines)
+                ui.notify(f"日志已导出：{result['path']}", type="positive", position="top-right")
+
+            keyword.on("keydown.enter", lambda: background_tasks.create(refresh()))
+            with ui.row().classes("w-full justify-between items-center no-wrap"):
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button("刷新", icon="refresh", on_click=lambda: background_tasks.create(refresh())).props(
+                        "flat dense no-caps"
+                    )
+                    ui.button("导出", icon="file_download", on_click=lambda: background_tasks.create(export())).props(
+                        "flat dense no-caps"
+                    )
+                    ui.button("打开目录", icon="folder_open", on_click=self._open_logs_dir).props(
+                        "flat dense no-caps"
+                    )
+                ui.button("关闭", on_click=self.dialog.close).props("flat dense no-caps")
+
+            background_tasks.create(refresh())
+
+        self.open_dialog("运行日志", builder)
 
     def _storage_text(self, storage: dict) -> str:
         if not storage.get("enabled"):

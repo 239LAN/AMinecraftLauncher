@@ -20,13 +20,15 @@ DEFAULT_UA = user_agent()
 CHUNK_SIZE = 1 << 16
 
 # 部分 CDN（如 forgecdn）的证书链在 Windows 自带信任库中不完整，
-# 优先使用 certifi 的 CA 包，缺失时回退系统默认。
-try:
+# 在系统信任库基础上追加 certifi 的 CA 包；同时保留系统根证书，
+# 避免企业代理 / 系统根证书被替换后 GitHub 等站点校验失败。
+_SSL_CONTEXT = ssl.create_default_context()
+try:  # pragma: no cover - 依赖运行环境是否安装 certifi
     import certifi
 
-    _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
-except Exception:  # pragma: no cover - certifi 缺失时保持系统默认
-    _SSL_CONTEXT = ssl.create_default_context()
+    _SSL_CONTEXT.load_verify_locations(cafile=certifi.where())
+except Exception:
+    pass
 
 # 可被外部（如 API 层）覆盖，用于统一注入代理 / 自定义 UA。
 opener: urllib.request.OpenerDirector = urllib.request.build_opener(
@@ -160,14 +162,26 @@ def request_json(
     try:
         with opener.open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
-            return response.status or 200, (json.loads(body) if body else {})
+            return response.status or 200, _parse_body(body)
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            payload = {"error": raw[:500]}
-        return exc.code, payload
+        return exc.code, _parse_body(raw, fallback={"error": raw[:500]})
+
+
+def _parse_body(body: str, *, fallback: Optional[dict] = None) -> dict:
+    """解析响应体：优先 JSON，退回 OAuth 常见的 form-urlencoded。"""
+    if not body:
+        return {}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        if "=" in body and not body.lstrip().startswith("<"):
+            parsed = urllib.parse.parse_qs(body, keep_blank_values=True)
+            if parsed:
+                return {key: values[0] for key, values in parsed.items()}
+        if fallback is not None:
+            return fallback
+        raise exc
 
 
 def get_json_auth(

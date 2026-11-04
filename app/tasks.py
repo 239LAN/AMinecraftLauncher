@@ -14,6 +14,7 @@ import traceback
 import uuid
 from collections import deque
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from engine.downloader import DownloadCancelled
@@ -153,13 +154,40 @@ class TaskManager:
         self._lock = threading.Lock()
         self._global_logs: deque[str] = deque(maxlen=MAX_GLOBAL_LOGS)
         self._revision = 0
+        self._log_file: Optional[Path] = None
 
     # ------------------------------------------------------------------ 日志
+    def set_log_file(self, path: Path) -> None:
+        """设置日志落盘位置；超过 5 MB 时轮转为 ``*.1``。"""
+        path = Path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+                backup = path.with_name(path.name + ".1")
+                backup.unlink(missing_ok=True)
+                path.replace(backup)
+        except OSError:
+            self._log_file = None
+            return
+        self._log_file = path
+
+    @property
+    def log_file(self) -> Optional[Path]:
+        return self._log_file
+
     def log(self, line: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         with self._lock:
             self._global_logs.append(f"[{stamp}] {line}")
             self._revision += 1
+            path = self._log_file
+            if path is not None:
+                try:
+                    full = time.strftime("%Y-%m-%d %H:%M:%S")
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(f"[{full}] {line}\n")
+                except OSError:
+                    pass
 
     def global_logs(self) -> tuple[list[str], int]:
         """返回 (全部日志, 版本号)，界面据此判断是否需要重绘。"""

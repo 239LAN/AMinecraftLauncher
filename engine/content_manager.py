@@ -326,8 +326,11 @@ class ContentManager:
         version_id: Optional[str] = None,
         isolated: bool = False,
     ) -> list[ScreenshotEntry]:
-        """列出全局截图目录下的图片文件（截图为全局资源，不受版本隔离影响）。"""
-        directory = self._paths.screenshots_dir
+        """列出截图目录下的图片文件；版本隔离时读取版本目录内的截图。"""
+        if isolated and version_id:
+            directory = self._paths.version_game_dir(version_id, isolated=True) / "screenshots"
+        else:
+            directory = self._paths.screenshots_dir
         entries: list[ScreenshotEntry] = []
         if not directory.is_dir():
             return entries
@@ -344,6 +347,31 @@ class ContentManager:
 
         entries.sort(key=lambda entry: entry.name.lower())
         return entries
+
+    def screenshot_dir(
+        self,
+        *,
+        version_id: Optional[str] = None,
+        isolated: bool = False,
+    ) -> Path:
+        if isolated and version_id:
+            return self._paths.version_game_dir(version_id, isolated=True) / "screenshots"
+        return self._paths.screenshots_dir
+
+    def delete_screenshot(
+        self,
+        name: str,
+        *,
+        version_id: Optional[str] = None,
+        isolated: bool = False,
+    ) -> None:
+        """删除一张截图。"""
+        name = _require_name(name, "截图名")
+        directory = self.screenshot_dir(version_id=version_id, isolated=isolated)
+        target = directory / name
+        if not target.is_file():
+            raise ContentError(f"截图不存在：{name}")
+        target.unlink()
 
     # ------------------------------------------------------------------ 远程
     def search(

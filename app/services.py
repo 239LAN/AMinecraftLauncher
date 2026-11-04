@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from engine import mirror as mirror_module
-from engine import mod_info, net, server_list, version_meta
+from engine import mod_info, net, server_list, updater, version_meta
 from engine.accounts import AccountError, AccountStore, ExternalAuthClient, SkinService, StoredAccount
 from engine.auth_client import AuthClient, AuthError, AuthResult, KeyringTokenStore
 from engine.content_manager import (
@@ -38,7 +39,8 @@ from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
 from engine.models import Account, FileEntry, GamePaths
 from engine.modpack import ModpackInstaller
-from engine.mod_provider import MODRINTH_API, ModProvider, build_provider
+from engine.mod_provider import CURSEFORGE_API, MODRINTH_API, ModProvider, build_provider
+from engine.version import APP_VERSION
 from engine.version_resolver import VersionResolver
 
 from .config import ConfigStore, LauncherConfig
@@ -56,6 +58,8 @@ class LauncherService:
         self.store = store
         self.secrets = secrets
         self.tasks = tasks
+        # 日志同时落盘，重启后仍可查看；界面只读取最近若干行。
+        self.tasks.set_log_file(self.store.data_dir / "logs" / "launcher.log")
         self.config: LauncherConfig = store.load()
         self._auth_client_id = self.config.client_id
         self._auth = AuthClient(client_id=self.config.client_id, store=KeyringTokenStore())
@@ -301,6 +305,40 @@ class LauncherService:
     # ------------------------------------------------------------------ 基础
     def log(self, line: str) -> None:
         self.tasks.log(line)
+
+    def launcher_logs(self, *, limit: int = 500, keyword: str = "") -> list[str]:
+        """读取启动器日志；优先读落盘文件（含上次运行），否则回退内存日志。"""
+        path = self.tasks.log_file
+        lines: list[str] = []
+        if path is not None and path.exists():
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except OSError:
+                lines = []
+        if not lines:
+            lines, _ = self.tasks.global_logs()
+        lines = [line.rstrip("\r\n") for line in lines]
+        if keyword.strip():
+            key = keyword.strip().lower()
+            lines = [line for line in lines if key in line.lower()]
+        return lines[-max(1, int(limit)):]
+
+    def export_launcher_logs(self, lines: Optional[list[str]] = None) -> dict:
+        """把日志导出到 data/logs，返回文件路径。"""
+        directory = self.store.data_dir / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = directory / f"launcher-{stamp}.log"
+        content = lines if lines is not None else self.launcher_logs(limit=100000)
+        target.write_text("\n".join(content), encoding="utf-8")
+        self.log(f"日志已导出：{target}")
+        return {"path": str(target)}
+
+    def logs_dir(self) -> str:
+        directory = self.store.data_dir / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        return str(directory)
 
     def _loader_java(self, task: Task, game_version: str) -> str:
         """Forge / NeoForge 安装器需要能运行对应版本的 Java，这里按原版要求准备。"""
@@ -1438,6 +1476,108 @@ class LauncherService:
             version_id=version_id,
         )
 
+    def mod_dependencies(
+        self,
+        source: str,
+        project_id: str,
+        *,
+        game_version: Optional[str] = None,
+        loader: Optional[str] = None,
+    ) -> list[dict]:
+        """解析目标 Mod 在所选版本下的必装前置，供界面弹窗一键安装。"""
+        source = (source or "modrinth").lower()
+        provider = build_provider(source, timeout=20)
+        files = provider.resolve_files(
+            project_id,
+            game_version=game_version,
+            loader=loader,
+        )
+        if not files:
+            return []
+        dependencies = files[0].dependencies or []
+        result: list[dict] = []
+        seen: set[str] = set()
+        for dep in dependencies:
+            if not isinstance(dep, dict):
+                continue
+            if source == "modrinth":
+                if str(dep.get("dependency_type") or "") != "required":
+                    continue
+                dep_project = str(dep.get("project_id") or "")
+                if not dep_project or dep_project == project_id or dep_project in seen:
+                    continue
+                seen.add(dep_project)
+                name, icon, filename = dep_project, "", str(dep.get("file_name") or "")
+                try:
+                    status, payload = net.get_json_auth(
+                        f"{MODRINTH_API}/project/{dep_project}",
+                        headers={"Accept": "application/json"},
+                        timeout=15,
+                    )
+                    if status == 200 and isinstance(payload, dict):
+                        name = str(payload.get("title") or name)
+                        icon = str(payload.get("icon_url") or "")
+                except Exception:  # noqa: BLE001 - 名称查询失败不影响安装
+                    pass
+                if not filename:
+                    try:
+                        dep_files = provider.resolve_files(
+                            dep_project, game_version=game_version, loader=loader
+                        )
+                        if dep_files:
+                            filename = dep_files[0].filename
+                    except Exception:  # noqa: BLE001
+                        pass
+                result.append(
+                    {
+                        "source": "modrinth",
+                        "project_id": dep_project,
+                        "name": name,
+                        "icon_url": icon,
+                        "filename": filename,
+                        "version_id": str(dep.get("version_id") or ""),
+                    }
+                )
+            else:
+                if int(dep.get("relationType") or 0) != 3:
+                    continue
+                dep_project = str(dep.get("modId") or "")
+                if not dep_project or dep_project == project_id or dep_project in seen:
+                    continue
+                seen.add(dep_project)
+                name, icon, filename = dep_project, "", ""
+                try:
+                    status, payload = net.get_json_auth(
+                        f"{CURSEFORGE_API}/mods/{dep_project}",
+                        headers={"Accept": "application/json"},
+                        timeout=15,
+                    )
+                    if status == 200 and isinstance(payload.get("data"), dict):
+                        data = payload["data"]
+                        name = str(data.get("name") or name)
+                        icon = str((data.get("logo") or {}).get("thumbnailUrl") or "")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    dep_files = provider.resolve_files(
+                        dep_project, game_version=game_version, loader=loader
+                    )
+                    if dep_files:
+                        filename = dep_files[0].filename
+                except Exception:  # noqa: BLE001
+                    pass
+                result.append(
+                    {
+                        "source": "curseforge",
+                        "project_id": dep_project,
+                        "name": name,
+                        "icon_url": icon,
+                        "filename": filename,
+                        "version_id": "",
+                    }
+                )
+        return result
+
     def _is_isolated(self, version_id: Optional[str]) -> bool:
         if not version_id:
             return False
@@ -1718,6 +1858,21 @@ class LauncherService:
                 version_id=version_id, isolated=isolated
             )
         ]
+
+    def screenshots_dir(self, version_id: Optional[str] = None) -> str:
+        return str(
+            self.content_manager().screenshot_dir(
+                version_id=version_id, isolated=self._is_isolated(version_id)
+            )
+        )
+
+    def delete_screenshot(self, name: str, version_id: Optional[str] = None) -> dict:
+        self.content_manager().delete_screenshot(
+            name, version_id=version_id, isolated=self._is_isolated(version_id)
+        )
+        self._capture_storage()
+        self.log(f"删除截图：{name}")
+        return {"name": name, "deleted": True}
 
     # ------------------------------------------------------------- 整合包
     def inspect_modpack(self, path: str) -> dict:
@@ -2242,6 +2397,41 @@ class LauncherService:
         view["mirror"] = self.mirror_status()
         view["storage"] = self.storage_status()
         return view
+
+    # ------------------------------------------------------------------ 自更新
+    def check_launcher_update(self) -> dict:
+        info = updater.fetch_latest()
+        info["current"] = APP_VERSION
+        info["available"] = updater.is_newer(info.get("version") or "", APP_VERSION)
+        info["frozen"] = bool(getattr(sys, "frozen", False))
+        return info
+
+    def _update_target(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return updater.update_target()
+        directory = self.store.data_dir / "updates"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "A Minecraft Launcher-update.exe"
+
+    def download_launcher_update(
+        self,
+        info: dict,
+        *,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        cancel: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        dest = self._update_target()
+        dest.unlink(missing_ok=True)
+        dest.with_name(dest.name + ".part").unlink(missing_ok=True)
+        self.log(f"开始下载更新 {info.get('version')}（公共 GH 代理优先）")
+        updater.download(info, dest, on_chunk=on_chunk, cancel=cancel)
+        self.log(f"更新已下载：{dest}")
+        return {"path": str(dest), "version": str(info.get("version") or "")}
+
+    def apply_launcher_update(self, path: str) -> dict:
+        script = updater.apply_update(Path(path))
+        self.log(f"已生成更新脚本，退出后将替换并重启：{script}")
+        return {"script": str(script)}
 
     def supports(self) -> dict:
         """供界面判断哪些能力可用（避免前端硬编码）。"""

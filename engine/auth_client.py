@@ -16,16 +16,18 @@ from typing import Optional, Protocol
 
 from . import net
 
-DEVICE_CODE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
-TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+# 使用 Live Connect 设备码端点：00000000402b5328 是微软第一方客户端 ID，
+# 只在该端点（MBI_SSL scope）下可用，Entra consumers 端点会报 AADSTS700016。
+DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
+TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
 MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 
-SCOPE = "XboxLive.signin offline_access"
+SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
 
-# 公开的 Minecraft 启动器客户端 ID（非机密），可在设置页覆盖。
+# 公开的 Minecraft 启动器客户端 ID（非机密，固定使用 Live Connect 设备码流程）。
 DEFAULT_CLIENT_ID = "00000000402b5328"
 KEYRING_SERVICE = "minicraftlauncher"
 
@@ -175,7 +177,11 @@ class AuthClient:
     def start_auth(self) -> DeviceCode:
         status, payload = net.request_json(
             DEVICE_CODE_URL,
-            form={"client_id": self.client_id, "scope": SCOPE},
+            form={
+                "client_id": self.client_id,
+                "scope": SCOPE,
+                "response_type": "device_code",
+            },
             timeout=self.timeout,
         )
         if status != 200 or "device_code" not in payload:
@@ -266,23 +272,31 @@ class AuthClient:
         return result
 
     def _xbox_live(self, ms_access_token: str) -> dict:
-        status, payload = net.request_json(
-            XBL_AUTH_URL,
-            json_body={
-                "Properties": {
-                    "AuthMethod": "RPS",
-                    "SiteName": "user.auth.xboxlive.com",
-                    "RpsTicket": f"d={ms_access_token}",
+        # Live Connect 下发的是 MBI 票据（t=），旧式 Entra 令牌用 d=；
+        # 两种前缀都尝试一次，避免因令牌来源不同导致登录链路中断。
+        last: dict = {}
+        for prefix in ("t=", "d="):
+            status, payload = net.request_json(
+                XBL_AUTH_URL,
+                json_body={
+                    "Properties": {
+                        "AuthMethod": "RPS",
+                        "SiteName": "user.auth.xboxlive.com",
+                        "RpsTicket": f"{prefix}{ms_access_token}",
+                    },
+                    "RelyingParty": "http://auth.xboxlive.com",
+                    "TokenType": "JWT",
                 },
-                "RelyingParty": "http://auth.xboxlive.com",
-                "TokenType": "JWT",
-            },
-            headers={"Accept": "application/json"},
-            timeout=self.timeout,
-        )
-        if status != 200 or "Token" not in payload:
-            raise AuthError(_describe(payload, "Xbox Live 认证失败"), code=str(status))
-        return {"token": payload["Token"], "uhs": payload["DisplayClaims"]["xui"][0]["uhs"]}
+                headers={"Accept": "application/json"},
+                timeout=self.timeout,
+            )
+            if status == 200 and "Token" in payload:
+                return {
+                    "token": payload["Token"],
+                    "uhs": payload["DisplayClaims"]["xui"][0]["uhs"],
+                }
+            last = payload
+        raise AuthError(_describe(last, "Xbox Live 认证失败"), code=str(status))
 
     def _xsts(self, xbl_token: str) -> dict:
         status, payload = net.request_json(
