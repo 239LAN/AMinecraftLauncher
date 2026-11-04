@@ -25,7 +25,7 @@ from app.config import ConfigStore, runtime_dir
 from app.secrets import SecretStore
 from app.services import LauncherService
 from app.tasks import TaskManager
-from app.ui import native_maximize_guard, setup_pages
+from app.ui import app_icon_file, native_maximize_guard, setup_pages
 from engine.version import APP_NAME, APP_VERSION
 
 
@@ -40,6 +40,10 @@ def _webview_available() -> bool:
 
 def build_app(*, debug: bool = False) -> LauncherService:
     store = ConfigStore()
+
+    assets = Path(getattr(sys, "_MEIPASS", runtime_dir())) / "assets"
+    if assets.is_dir():
+        app.add_static_files("/aml-assets", str(assets))
 
     tasks = TaskManager()
     service = LauncherService(store, SecretStore(), tasks)
@@ -107,9 +111,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _icon_path() -> str:
     """优先使用打包/源码目录下的 AML 图标。"""
-    base = Path(getattr(sys, "_MEIPASS", runtime_dir()))
-    icon = base / "assets" / "aml.ico"
-    return str(icon) if icon.exists() else "🎮"
+    icon = app_icon_file()
+    return str(icon) if icon else "🎮"
 
 
 def _free_port() -> int:

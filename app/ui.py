@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +31,16 @@ NAV_ITEMS = [
 
 # 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
 CHANGELOG = [
+    {
+        "version": "1.3.1",
+        "title": "图标重绘",
+        "notes": """\
+- 重绘应用图标：小圆角无边框，AML 字号放大且不加粗
+- 标题栏图标改用 AML 图标资源，与 exe 图标保持一致
+- 修复任务栏图标发糊：按屏幕 DPI 分别加载大 / 小图标，图标文件内置多尺寸原生帧
+- 标题栏图标圆角调小，玩家头像改为直角
+""",
+    },
     {
         "version": "1.3.0",
         "title": "加载器 · Mod 管理 · 存档服务器",
@@ -215,11 +226,10 @@ body {
   border-bottom: 1px solid var(--aml-border);
 }
 .aml-logo {
-  width: 36px; height: 36px; border-radius: 11px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--aml-accent); color: #fff;
+  width: 40px; height: 40px; border-radius: 3px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
 }
-.aml-logo .q-icon { color: #fff; font-size: 24px !important; }
+.aml-logo img { width: 100%; height: 100%; display: block; }
 .aml-topnav {
   display: flex; align-items: center; gap: 6px; padding: 6px 12px;
   border-radius: 999px; cursor: pointer; color: #4b5563;
@@ -625,6 +635,75 @@ class ImportDrop:
         self.fill.style("width: 0%")
 
 
+def app_icon_file() -> Optional[Path]:
+    """返回打包 / 源码目录下的 AML 图标文件。"""
+    from .config import runtime_dir
+
+    base = Path(getattr(sys, "_MEIPASS", runtime_dir()))
+    icon = base / "assets" / "aml.ico"
+    return icon if icon.exists() else None
+
+
+def _apply_native_window_icon(form) -> None:
+    """按当前 DPI 分别加载大 / 小图标，避免任务栏把 32px 图标拉伸而发糊。"""
+    if sys.platform != "win32":
+        return
+    icon = app_icon_file()
+    if icon is None:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.LoadImageW.restype = wintypes.HANDLE
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = wintypes.LPARAM
+
+    try:
+        hwnd = int(form.Handle.ToInt32())
+    except Exception:  # noqa: BLE001 - 窗体销毁期间忽略
+        return
+    try:
+        dpi = int(user32.GetDpiForWindow(hwnd)) or 96
+    except Exception:  # noqa: BLE001 - 旧系统没有该接口
+        dpi = 96
+
+    def metric(index: int, fallback: int) -> int:
+        value = 0
+        try:
+            value = int(user32.GetSystemMetricsForDpi(index, dpi))
+        except Exception:  # noqa: BLE001
+            value = 0
+        if not value:
+            try:
+                value = int(user32.GetSystemMetrics(index))
+            except Exception:  # noqa: BLE001
+                value = fallback
+        return max(16, value)
+
+    # SM_CXICON / SM_CXSMICON：随 DPI 变化，图标文件里已有对应尺寸的原始帧。
+    sizes = ((1, metric(11, 32)), (0, metric(49, 16)))  # ICON_BIG / ICON_SMALL
+    for index, size in sizes:
+        handle = user32.LoadImageW(
+            None, str(icon), 1, size, size, 0x00000010  # IMAGE_ICON / LR_LOADFROMFILE
+        )
+        if handle:
+            user32.SendMessageW(hwnd, 0x0080, index, handle)  # WM_SETICON
+
+
 def native_maximize_guard() -> None:
     """无边框窗口最大化时会盖住任务栏，这里把最大化范围限制在屏幕工作区。
 
@@ -670,6 +749,11 @@ def native_maximize_guard() -> None:
         windows[0].events.restored += _refresh
     except Exception:  # noqa: BLE001 - 安装失败时退回系统默认行为
         return
+
+    # NiceGUI 默认把小图标和大图标都设成同一个 32px 句柄，任务栏会拉伸发糊；
+    # 这里按 DPI 重设一次，并在窗口显示后（NiceGUI 设置图标之后）再补一次。
+    _apply_native_window_icon(form)
+    threading.Timer(1.0, lambda: _apply_native_window_icon(form)).start()
 
 
 class LauncherUI:
@@ -740,7 +824,7 @@ class LauncherUI:
         ):
             with ui.row().classes("items-center gap-2.5 no-wrap shrink-0"):
                 with ui.element("div").classes("aml-logo"):
-                    ui.icon("auto_awesome").classes("text-[19px]")
+                    ui.image("/aml-assets/aml.png")
                 with ui.column().classes("gap-0 no-wrap").style("line-height: 1.15"):
                     ui.label(APP_NAME).classes("text-[14px] font-semibold")
                     ui.label(f"v{APP_VERSION}").classes("text-[10px]").style(
@@ -1150,7 +1234,7 @@ class LauncherUI:
         with ui.element("div").classes(
             "aml-avatar overflow-hidden flex items-center justify-center"
         ).style(
-            "width:84px;height:84px;border-radius:14px;"
+            "width:84px;height:84px;border-radius:0;"
             "background:#f3f4f6;border:1px solid #e5e7eb"
         ):
             if url:
