@@ -63,6 +63,8 @@ class LauncherConfig:
     # 哈希文件库（实验性）：游戏文件按 SHA1 去重存放，启动时物化到临时目录。
     hash_store: bool = False
     last_account: str = ""
+    # 启动页登录方式：offline / microsoft，空表示按上次登录账号决定。
+    login_mode: str = ""
     # 版本级覆盖：{version_id: {key: value}}，只存被显式修改过的项。
     version_settings: dict = field(default_factory=dict)
 

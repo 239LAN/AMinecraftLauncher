@@ -36,24 +36,42 @@ FOOTER_LEGACY = "> 暂仅支持离线登录；最低系统要求： Windows 10(2
 
 CHANGELOG = [
     {
+        "version": "1.4.1",
+        "title": "登录切换 · 日志整理",
+        "notes": """\
+### 新增
+- 启动页可在正版登录与离线登录之间切换
+- 正版登录自动复制设备码，并在 1 秒后打开浏览器
+- 正版账号与离线账号独立保存，切换登录方式即可快速切换账号
+- 启动页默认沿用上次的登录方式，首次使用默认正版登录
+
+### 优化
+- 正版登录排在离线登录前，登录按钮不再显示图标
+- 更新日志改为只描述功能变化，不再罗列操作与实现细节
+
+### 修复
+- 无
+
+"""
+        + FOOTER_CURRENT,
+    },
+    {
         "version": "1.4.0",
         "title": "内容管理 · 自动更新",
         "notes": """\
 ### 新增
-- 版本页新增资源包与光影管理：批量导入、启用 / 禁用、删除与打开目录
-- 新增截图管理：缩略图预览、打开目录与删除截图，版本隔离时读取对应版本目录
-- Mod 开始下载后自动检查必装前置，缺失时弹窗列出并可一键安装
-- 新增启动器自动更新：启动时静默检查 GitHub Release，下载优先走公共 GH 代理，失败回退直连，完成后可重启替换
-- 新增运行日志查看：关键字筛选、刷新、导出与打开日志目录，日志同时落盘到 data/logs/launcher.log
-- 启动页新增微软正版登录：设备码授权后自动轮询完成登录，支持复制设备码与打开浏览器
+- 新增资源包与光影包管理
+- 新增存档截图管理
+- 新增启动器自动更新
+- 新增运行日志查看
+- 新增微软正版登录
+- 下载 Mod 后自动提示缺少的前置依赖，可一键安装
 
 ### 优化
-- 移除标题栏左侧应用图标，界面更简洁
-- 设置中移除设备码 / 微软客户端 ID 配置项，登录无需手动配置客户端 ID
+- 移除标题栏图标，设置中不再需要填写客户端 ID
 
 ### 修复
-- 修复检查更新时 GitHub API 证书校验失败的问题
-- 修复截图缩略图未按比例裁切、Mod 前置依赖重复提示与日志面板重复行的问题
+- 无
 
 """
         + FOOTER_CURRENT,
@@ -66,12 +84,10 @@ CHANGELOG = [
 - 无
 
 ### 优化
-- 重绘应用图标：小圆角无边框，AML 字号放大且不加粗
-- 标题栏图标改用 AML 图标资源，与 exe 图标保持一致
-- 标题栏图标圆角调小，玩家头像改为直角
+- 重绘应用图标，标题栏与程序图标保持一致
 
 ### 修复
-- 修复任务栏图标发糊：按屏幕 DPI 分别加载大 / 小图标，图标文件内置多尺寸原生帧
+- 修复任务栏图标显示模糊
 
 """
         + FOOTER_LEGACY,
@@ -81,14 +97,12 @@ CHANGELOG = [
         "title": "加载器 · Mod 管理 · 存档服务器",
         "notes": """\
 ### 新增
-- 下载安装游戏时可直接选择 Fabric / Forge / NeoForge / Quilt 及加载器版本
-- 安装时可自定义版本名称，同一原版版本可共存多份；版本页支持重命名
-- 导入本地或在线整合包时，确认弹窗内可直接命名版本
-- Mod 列表读取 JAR 元数据，显示模组名称、版本与图标，不再是文件名
-- 新增 Mod 启用 / 禁用（重命名 .disabled），状态一目了然
-- 进入 Mod 管理时自动检查更新：按 SHA1 反查 Modrinth，匹配当前游戏版本与加载器后显示更新标记，可一键更新
-- 新增存档管理：备份为 zip、导入存档、删除存档、打开存档目录
-- 新增服务器管理：读取与写入 servers.dat，添加和删除服务器
+- 安装游戏时可选 Fabric / Forge / NeoForge / Quilt 加载器
+- 安装游戏与导入整合包时可自定义版本名称，版本支持重命名
+- Mod 列表显示模组名称、版本与图标
+- 支持启用 / 禁用 Mod
+- 进入 Mod 管理时自动检查更新，可一键更新
+- 新增存档管理与服务器管理
 
 ### 优化
 - 无
@@ -110,8 +124,8 @@ CHANGELOG = [
 - 无
 
 ### 修复
-- 修复无边框窗口最大化后覆盖任务栏的问题，最大化时自动贴合当前屏幕可用工作区
-- 多显示器下按窗口所在屏幕计算最大化区域，还原时回到最大化前的位置与尺寸
+- 修复窗口最大化后遮挡任务栏
+- 修复多显示器下最大化与还原位置不正确
 
 """
         + FOOTER_LEGACY,
@@ -124,19 +138,16 @@ CHANGELOG = [
 - 无
 
 ### 优化
-- 大文件与未下载部分统一进入分片任务池，持续保持高并发，取消后可续传
-- 镜像与官方源都可用时双源并行下载，单个源失败自动换源
-- 整合包安装重做：自动补全原版、按包内清单安装加载器、补全加载器文件并开启版本隔离
-- 整合包 Mod 改为并发下载，CurseForge 旧文件可直接按 ID 查询
-- 导入 Mod / 整合包保留原始文件名，大文件改为流式落盘
-- 游戏文件安装任务串行排队，安装期间启动会给出提示；排队任务可随时取消
-- 优化任务阶段展示、加载器列表 / 崩溃诊断后台执行、Java 探测与安装流程
-- 配置文件、账户清单、版本 JSON 改为原子写入；哈希库流式压缩并忽略分片文件
+- 下载支持断点续传、分片并发与双源加速
+- 重做整合包安装，自动补全游戏与加载器
+- 整合包 Mod 支持并发下载
+- 导入 Mod 与整合包时保留原文件名
+- 安装任务改为排队执行，可随时取消
 
 ### 修复
-- 修复桌面模式关闭按钮无效，关闭时可靠退出并保存存档
-- 修复下载进度超过 100%：断点续传 / 分片回退时不再重复计数
-- 修复 Forge / NeoForge 游戏版本识别错误，Mod 筛选更准确
+- 修复关闭按钮无响应
+- 修复下载进度可能超过 100%
+- 修复 Forge / NeoForge 版本识别错误
 
 """
         + FOOTER_LEGACY,
@@ -149,13 +160,12 @@ CHANGELOG = [
 - 无
 
 ### 优化
-- 哈希库对配置 / 存档 / 日志等可写文件启用 zlib 压缩，jar 与资源继续硬链接
-- 启动器异常退出后，下次启动会自动回收未同步的游戏目录
-- 哈希存储开启时禁止切换游戏目录；有任务进行时禁止切换存储方式
-- 启动前检查是否已有游戏在运行，避免重复启动
+- 哈希存储支持压缩，减少磁盘占用
+- 启动器异常退出后自动回收残留文件
+- 避免重复启动与误切换游戏目录
 
 ### 修复
-- 修复 Web 模式关闭标签页时误清空工作目录的问题
+- 修复浏览器模式关闭页面时清空游戏目录
 
 """
         + FOOTER_LEGACY,
@@ -165,17 +175,14 @@ CHANGELOG = [
         "title": "哈希存储 · 去重启动",
         "notes": """\
 ### 新增
-- 新增哈希存储（实验性）：游戏文件按 SHA1 去重存入 mcfile，文件树映射驱动启动
-- 启动时物化到临时目录（只读文件硬链接、可写文件复制），退出后同步并清理
-- 关闭启动器时先结束游戏并同步存档；系统关机时自动结束并尽力保存
-- 设置中可原子迁移开启 / 关闭，迁移需约 2 倍磁盘空间
+- 新增哈希存储（实验性），相同文件只保存一份
+- 支持开启 / 关闭存储方式并自动迁移
 
 ### 优化
-- 下载 / 安装时已存在的文件直接跳过，避免重复下载
-- 开启哈希存储后游戏文件无法被其它启动器读取（实验性限制）
+- 已存在的文件不再重复下载
 
 ### 修复
-- 修复若干界面细节与存储边界问题
+- 修复若干界面与存储问题
 
 """
         + FOOTER_LEGACY,
@@ -185,21 +192,18 @@ CHANGELOG = [
         "title": "界面重构 · CurseForge 镜像",
         "notes": """\
 ### 新增
-- 新增哈希存储（实验性）：SHA1 去重、临时目录启动、退出同步、原子迁移
-- CurseForge 改走 mcimirror 公共镜像，无需 API Key
+- 新增哈希存储（实验性）
+- CurseForge 下载无需配置 API Key
 
 ### 优化
-- 界面重构为简洁浅色风格：白色卡片 + 单一蓝色强调，去掉渐变与光晕
-- 页面切换淡入、按钮按压缩放动画；导航更名「主页」为「启动」
-- 主页左侧改为更新日志，默认展开最新版本，收起只显示版本号
-- 导入本地 Mod / 整合包改为单个拖放卡片，导入进度原位展示
-- 启动页拖入 .jar 或整合包可自动识别，确认后直接导入
-- 启动过程改为启动页内联展示步骤与进度，支持取消，不再弹窗
-- 创建任务后自动跳转任务页，结束后 3 秒自动移除
-- 关闭启动器前会检查游戏进程，系统关机时直接结束游戏并尽力保存存档
+- 界面改为简洁浅色风格
+- 主页新增更新日志
+- 导入 Mod 与整合包改为拖放
+- 启动进度改为页面内展示，可取消
+- 启动器退出前自动结束游戏并保存存档
 
 ### 修复
-- 修复边缘 CDN 证书链缺失导致的下载失败
+- 修复部分 CDN 下载失败
 
 """
         + FOOTER_LEGACY,
@@ -381,6 +385,13 @@ body {
   border-radius: 16px;
   box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
 }
+.aml-login-toggle {
+  background: var(--aml-surface-2);
+  border: 1px solid var(--aml-border);
+  border-radius: 999px;
+  padding: 3px;
+}
+.aml-login-toggle .q-btn { border-radius: 999px !important; }
 
 .aml-launch {
   background: var(--aml-accent) !important;
@@ -873,6 +884,7 @@ class LauncherUI:
         self._launch_timer = None
         self._home_launching = False
         self._home_launch_timer = None
+        self._login_mode: str = ""
         self._launch_cancel = threading.Event()
         self._launch_progress: dict = {"percent": 0.0, "detail": "准备中…"}
         self._launch_done = False
@@ -1293,7 +1305,28 @@ class LauncherUI:
             return
 
         account = self._active_account()
+        if not getattr(self, "_login_mode", ""):
+            # 优先沿用上次的登录方式；没有记录时沿用上次登录账号的类型；
+            # 都没有时默认正版登录。
+            saved = str(getattr(self.service.config, "login_mode", "") or "")
+            if saved not in ("offline", "microsoft"):
+                kind = account.get("kind") if account else ""
+                saved = kind if kind in ("offline", "microsoft") else "microsoft"
+            self._login_mode = saved
+        mode = self._login_mode
+        # 正版与离线账号互相独立，只展示当前登录方式对应的账号。
+        if account and account.get("kind") != mode:
+            self._activate_mode_account(mode)
+            account = self._active_account()
+        if account and account.get("kind") != mode:
+            account = None
+
         with self.home_identity:
+            ui.toggle(
+                {"microsoft": "正版登录", "offline": "离线登录"},
+                value=mode,
+                on_change=self._on_login_mode_change,
+            ).props("no-caps dense unelevated").classes("aml-login-toggle")
             self._render_avatar(account)
             if account:
                 ui.label(account["name"]).classes("text-[18px] font-semibold")
@@ -1304,6 +1337,11 @@ class LauncherUI:
                     ui.button("退出登录", on_click=self._logout_home).props(
                         "flat dense no-caps"
                     ).classes("aml-sub")
+            elif mode == "microsoft":
+                ui.button("登录", on_click=self._home_ms_login).classes(
+                    "w-[220px]"
+                ).props("unelevated dense no-caps color=primary")
+                ui.label("将自动复制设备码并打开浏览器").classes("aml-sub")
             else:
                 self.home_name = ui.input(
                     placeholder="输入用户名", value=draft
@@ -1314,10 +1352,45 @@ class LauncherUI:
                 ui.button("离线登录", icon="login", on_click=self._home_login).classes(
                     "w-[220px]"
                 ).props("unelevated dense no-caps color=primary")
-                ui.button(
-                    "正版登录", icon="verified_user", on_click=self._home_ms_login
-                ).classes("w-[220px]").props("outline dense no-caps color=primary")
-                ui.label("使用微软账号登录更安全").classes("aml-sub")
+
+    def _on_login_mode_change(self, event) -> None:
+        mode = str(getattr(event, "value", "") or "")
+        if mode not in ("offline", "microsoft"):
+            return
+        self._set_login_mode(mode)
+        self._activate_mode_account(mode)
+        self._refresh_home()
+
+    def _set_login_mode(self, mode: str) -> None:
+        """切换并记住登录方式，下次启动优先使用。"""
+        self._login_mode = mode
+        if getattr(self.service.config, "login_mode", "") == mode:
+            return
+        try:
+            self.service.update_config({"login_mode": mode})
+        except Exception:  # noqa: BLE001 - 配置写入失败不影响本次登录
+            pass
+
+    def _activate_mode_account(self, mode: str) -> None:
+        """切换登录方式时，直接切换到该方式下最近使用的账号。"""
+        try:
+            candidates = [a for a in self.service.accounts() if a.get("kind") == mode]
+        except Exception:  # noqa: BLE001 - 账号读取失败时停留在当前账号
+            return
+        if mode == "microsoft":
+            # 跳过上次登录中断、没有写入令牌的账号。
+            store = self.service.accounts_store
+            candidates = [a for a in candidates if store.get_tokens(a["id"]) is not None]
+        if not candidates:
+            return
+        latest = max(candidates, key=lambda a: a.get("last_used") or 0)
+        active = self._active_account()
+        if active and active.get("id") == latest.get("id"):
+            return
+        try:
+            self.service.account_set_active(latest["id"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _render_avatar(self, account: Optional[dict]) -> None:
         url = ""
@@ -1349,6 +1422,7 @@ class LauncherUI:
             ui.notify(f"登录失败：{exc}", type="negative", position="top-right")
             return
         ui.notify(f"已登录：{name}", type="positive", position="top-right")
+        self._set_login_mode("offline")
         self._refresh_home()
 
     async def _home_ms_login(self) -> None:
@@ -1378,7 +1452,8 @@ class LauncherUI:
 
         def builder() -> None:
             ui.label("微软账号登录").classes("text-[16px] font-semibold")
-            ui.label("1. 打开下面的网址　2. 输入设备码并完成授权").classes("aml-sub")
+            ui.label("设备码已复制，1 秒后自动打开浏览器").classes("aml-sub")
+            ui.label("在授权页粘贴设备码并确认登录").classes("aml-sub")
             ui.label(info["verification_uri"]).classes("text-[13px] select-all")
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 ui.label(info["user_code"]).classes("text-[22px] font-semibold").style(
@@ -1410,6 +1485,7 @@ class LauncherUI:
                     stop()
                     self.dialog.close()
                     name = (result.get("stored") or {}).get("name") or "微软账号"
+                    self._set_login_mode("microsoft")
                     ui.notify(f"正版登录成功：{name}", type="positive", position="top-right")
                     self._refresh_home()
 
@@ -1423,7 +1499,15 @@ class LauncherUI:
                 max(5, int(info.get("interval") or 5)), poll
             )
 
+        self._set_login_mode("microsoft")
         self.open_dialog("正版登录", builder)
+        # 设备码自动复制，1 秒后自动打开授权页（也保留手动按钮作为兜底）。
+        ui.clipboard.write(info["user_code"])
+        ui.timer(
+            1.0,
+            lambda: webbrowser.open(info["verification_uri"]),
+            once=True,
+        )
 
     async def _logout_home(self) -> None:
         account = self._active_account()

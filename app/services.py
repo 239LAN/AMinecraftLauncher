@@ -2224,10 +2224,14 @@ class LauncherService:
         return account
 
     def auth_poll(self, device_code: str) -> dict:
-        result = self.auth.poll_auth(device_code)
-        if result is None:
-            return {"status": "pending"}
-        account = self._register_msa(result)
+        try:
+            result = self.auth.poll_auth(device_code)
+            if result is None:
+                return {"status": "pending"}
+            account = self._register_msa(result)
+        except Exception as exc:  # noqa: BLE001 - 记录完整错误，便于排查登录链路
+            self.log(f"微软登录失败：{exc!r}")
+            raise
         self.log(f"微软账号登录成功：{result.name}")
         return {"status": "ok", "account": self.account_info(), "stored": account.as_dict()}
 
@@ -2369,6 +2373,7 @@ class LauncherService:
             "mod_loader",
             "isolated",
             "last_account",
+            "login_mode",
         }
         for key, value in changes.items():
             if key in allowed:

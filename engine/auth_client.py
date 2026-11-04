@@ -95,7 +95,13 @@ class TokenStore(Protocol):
 
 
 class KeyringTokenStore:
-    """把令牌 JSON 存进系统凭据管理器（keyring）。"""
+    """把令牌 JSON 存进系统凭据管理器（keyring）。
+
+    Windows 凭据管理器单条记录约 2560 字节，登录令牌 JSON 往往超出上限，
+    因此分片写入多条记录，读取时再拼接。
+    """
+
+    MAX_CHUNK = 1000
 
     def __init__(self, service: str = KEYRING_SERVICE, account: str = "msa_refresh") -> None:
         self.service = service
@@ -111,11 +117,28 @@ class KeyringTokenStore:
         except Exception:  # noqa: BLE001 - keyring 不可用时降级
             return False
 
+    def _chunk_name(self, index: int) -> str:
+        return f"{self.account}#{index}"
+
+    def _count_name(self) -> str:
+        return f"{self.account}#count"
+
     def load(self) -> Optional[dict]:
         try:
             import keyring
 
-            raw = keyring.get_password(self.service, self.account)
+            raw_count = keyring.get_password(self.service, self._count_name())
+            count = int(raw_count) if raw_count else 0
+            if count:
+                parts = []
+                for index in range(count):
+                    chunk = keyring.get_password(self.service, self._chunk_name(index))
+                    if chunk is None:
+                        return None
+                    parts.append(chunk)
+                raw = "".join(parts)
+            else:
+                raw = keyring.get_password(self.service, self.account)
             return json.loads(raw) if raw else None
         except Exception:  # noqa: BLE001
             return None
@@ -123,14 +146,37 @@ class KeyringTokenStore:
     def save(self, data: dict) -> None:
         import keyring
 
-        keyring.set_password(self.service, self.account, json.dumps(data))
+        raw = json.dumps(data)
+        chunks = [raw[i:i + self.MAX_CHUNK] for i in range(0, len(raw), self.MAX_CHUNK)]
+        for index, chunk in enumerate(chunks):
+            keyring.set_password(self.service, self._chunk_name(index), chunk)
+        keyring.set_password(self.service, self._count_name(), str(len(chunks)))
+        index = len(chunks)
+        while keyring.get_password(self.service, self._chunk_name(index)) is not None:
+            keyring.delete_password(self.service, self._chunk_name(index))
+            index += 1
+        try:
+            keyring.delete_password(self.service, self.account)
+        except Exception:  # noqa: BLE001 - 旧记录不存在时忽略
+            pass
 
     def clear(self) -> None:
         try:
             import keyring
 
-            keyring.delete_password(self.service, self.account)
-        except Exception:  # noqa: BLE001 - 不存在时忽略
+            raw_count = keyring.get_password(self.service, self._count_name())
+            count = int(raw_count) if raw_count else 0
+            for index in range(count):
+                try:
+                    keyring.delete_password(self.service, self._chunk_name(index))
+                except Exception:  # noqa: BLE001
+                    pass
+            for name in (self._count_name(), self.account):
+                try:
+                    keyring.delete_password(self.service, name)
+                except Exception:  # noqa: BLE001 - 不存在时忽略
+                    pass
+        except Exception:  # noqa: BLE001
             pass
 
 
