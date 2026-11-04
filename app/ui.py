@@ -36,6 +36,20 @@ FOOTER_LEGACY = "> 暂仅支持离线登录；最低系统要求： Windows 10(2
 
 CHANGELOG = [
     {
+        "version": "1.4.2",
+        "title": "头像与界面精简",
+        "notes": """\
+### 新增
+- 正版账号头像改为从皮肤 API 获取；未登录与离线账号显示史蒂夫头像
+
+### 优化
+- 移除启动页与登录弹窗中的多余提示文字
+
+### 修复
+- 无
+""",
+    },
+    {
         "version": "1.4.1",
         "title": "登录切换 · 日志整理",
         "notes": """\
@@ -1252,9 +1266,6 @@ class LauncherUI:
                     self.home_launch = ui.button(
                         "启动游戏", icon="play_circle", on_click=self._on_home_launch_click
                     ).classes("aml-launch w-full h-[50px] text-[15px]").props("unelevated no-caps")
-                    ui.label("可将 Mod（.jar）或整合包（.mrpack / .zip）拖到本页导入").classes(
-                        "aml-sub text-center"
-                    ).style("line-height: 1.5")
 
             # 启动页拖入的 Mod / 整合包由这个隐藏控件接收。
             ui.upload(
@@ -1341,7 +1352,6 @@ class LauncherUI:
                 ui.button("登录", on_click=self._home_ms_login).classes(
                     "w-[220px]"
                 ).props("unelevated dense no-caps color=primary")
-                ui.label("将自动复制设备码并打开浏览器").classes("aml-sub")
             else:
                 self.home_name = ui.input(
                     placeholder="输入用户名", value=draft
@@ -1393,23 +1403,20 @@ class LauncherUI:
             pass
 
     def _render_avatar(self, account: Optional[dict]) -> None:
-        url = ""
-        # 离线账号的 UUID 不在 Mojang / crafatar 上，请求头像只会得到破损图片。
-        if account and account.get("kind") != "offline":
+        # 正版账号头像来自皮肤 API；离线账号与未登录状态使用本地史蒂夫头像。
+        url = "/aml-assets/steve.png"
+        if account and account.get("kind") == "microsoft":
             try:
-                url = self.service.account_skin(account["id"]).get("avatar") or ""
-            except Exception:  # noqa: BLE001 - 皮肤服务不可用时用占位头像
-                url = ""
+                url = self.service.account_skin(account["id"]).get("avatar") or url
+            except Exception:  # noqa: BLE001 - 皮肤服务不可用时用默认头像
+                pass
         with ui.element("div").classes(
             "aml-avatar overflow-hidden flex items-center justify-center"
         ).style(
             "width:84px;height:84px;border-radius:0;"
             "background:#f3f4f6;border:1px solid #e5e7eb"
         ):
-            if url:
-                ui.image(url).style("width:84px;height:84px;object-fit:cover")
-            else:
-                ui.icon("person").classes("text-[44px]").style("color: var(--aml-muted)")
+            ui.image(url).style("width:84px;height:84px;object-fit:cover")
 
     async def _home_login(self) -> None:
         name = (getattr(self, "home_name", None).value or "").strip() if hasattr(self, "home_name") else ""
@@ -1452,8 +1459,6 @@ class LauncherUI:
 
         def builder() -> None:
             ui.label("微软账号登录").classes("text-[16px] font-semibold")
-            ui.label("设备码已复制，1 秒后自动打开浏览器").classes("aml-sub")
-            ui.label("在授权页粘贴设备码并确认登录").classes("aml-sub")
             ui.label(info["verification_uri"]).classes("text-[13px] select-all")
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 ui.label(info["user_code"]).classes("text-[22px] font-semibold").style(

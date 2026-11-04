@@ -47,6 +47,7 @@ hiddenimports += [
 datas += [
     ("assets/aml.ico", "assets"),
     ("assets/aml.png", "assets"),
+    ("assets/steve.png", "assets"),
     ("README.md", "."),
     ("LICENSE", "."),
 ]
