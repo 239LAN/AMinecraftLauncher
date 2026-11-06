@@ -1,0 +1,31 @@
+# frp 服务端（frps）配置示例
+# 与 AML relay 配合使用：房主把本机游戏端口以 STCP 代理注册到本机，
+# 访客再通过 STCP visitor 映射回自己的 127.0.0.1 端口，无需在服务器上开放游戏端口。
+
+bindAddr = "0.0.0.0"
+# 客户端（frpc）连接端口，需与 relay.env 中的 AML_FRPS_PORT 一致
+bindPort = 3300
+
+# 认证口令，必须与 relay.env 中的 AML_FRPS_TOKEN 完全一致
+auth.token = "请替换为随机强口令"
+
+# 强制 TLS，避免隧道凭据在公网明文传输
+transport.tls.force = true
+
+# 限制每个客户端最多注册的代理数量
+maxPortsPerClient = 2
+
+# 仅允许极小的 TCP 端口段；STCP 联机不需要远程端口，
+# 这样可阻止拿不到授权的客户端把其他 TCP 服务穿透到公网。
+allowPorts = [{ start = 30000, end = 30010 }]
+
+# 仅本机可访问的 Web 管理台，用于查看在线隧道与代理状态
+webServer.addr = "127.0.0.1"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "请替换为管理密码"
+
+# 日志保留天数
+log.to = "./frps.log"
+log.level = "info"
+log.maxDays = 7

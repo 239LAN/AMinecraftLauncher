@@ -16,12 +16,13 @@ import tempfile
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
 from engine import mirror as mirror_module
-from engine import mod_info, net, server_list, updater, version_meta
+from engine import mod_info, net, relay as relay_engine, server_list, updater, version_meta
 from engine.accounts import AccountError, AccountStore, ExternalAuthClient, SkinService, StoredAccount
 from engine.auth_client import AuthClient, AuthError, AuthResult, KeyringTokenStore
 from engine.content_manager import (
@@ -83,6 +84,13 @@ class LauncherService:
         self._game_process: Optional[subprocess.Popen] = None
         self._game_version = ""
         self._game_run_dir: Optional[Path] = None
+        # 联机：frpc 隧道与当前房间状态（房主或访客）。
+        self._relay_runner = relay_engine.TunnelRunner(
+            self.store.data_dir / "tools", self.store.data_dir / "relay"
+        )
+        self._relay_sessions: dict[str, dict] = {}
+        self._relay_room: Optional[dict] = None
+        self._relay_guest: Optional[dict] = None
         if self.config.hash_store:
             recovered = self._recover_runs()
             self._ensure_work_tree(recovered)
@@ -281,6 +289,9 @@ class LauncherService:
     def shutdown_storage(self) -> None:
         """启动器退出前调用：结束游戏并回收工作目录。"""
         self.stop_game()
+        self._relay_runner.stop()
+        self._relay_room = None
+        self._relay_guest = None
         if not self.config.hash_store or self._storage_closed:
             return
         self._storage_closed = True
@@ -1015,6 +1026,7 @@ class LauncherService:
         dry_run: bool = False,
         progress: Optional[Callable[[dict], None]] = None,
         cancel: Optional[Callable[[], bool]] = None,
+        extra_game: Optional[list[str]] = None,
     ) -> dict:
         """构建命令行并拉起 Java；只触发 Popen，不阻塞调用方。
 
@@ -1092,7 +1104,7 @@ class LauncherService:
                 width=width or settings.get("width"),
                 height=height or settings.get("height"),
                 extra_jvm=[*extra_jvm, *(settings.get("extra_jvm") or [])],
-                extra_game=list(settings.get("extra_game") or []),
+                extra_game=[*(settings.get("extra_game") or []), *(extra_game or [])],
                 game_directory=game_dir,
                 java=java,
             )
@@ -2437,6 +2449,393 @@ class LauncherService:
         script = updater.apply_update(Path(path))
         self.log(f"已生成更新脚本，退出后将替换并重启：{script}")
         return {"script": str(script)}
+
+    # ------------------------------------------------------------------ 联机
+    def relay_master(self) -> str:
+        """主节点地址随安装包内置，不提供配置项。"""
+        return relay_engine.master_endpoint()
+
+    def relay_nodes(self) -> list[dict]:
+        nodes = relay_engine.fetch_nodes(self.relay_master())
+        if not nodes:
+            raise relay_engine.RelayError("联机服务暂无可用节点")
+        return nodes
+
+    def _relay_display_name(self) -> str:
+        """联机房间显示的名字：优先用当前登录账号，离线也能开房。"""
+        account = self._accounts.active()
+        return str(getattr(account, "name", "") or "")[:32]
+
+    def relay_session(self, api: str) -> dict:
+        """换取某个节点的会话令牌，过期前复用。"""
+        cached = self._relay_sessions.get(api)
+        if cached and time.time() < float(cached.get("expires_at") or 0) - 60:
+            return cached
+        payload = relay_engine.RelayClient(api).session(self._relay_display_name())
+        payload["api"] = api
+        payload["expires_at"] = time.time() + int(payload.get("expires_in") or 3600)
+        self._relay_sessions[api] = payload
+        return payload
+
+    def _relay_client(self, api: str) -> relay_engine.RelayClient:
+        session = self.relay_session(api)
+        return relay_engine.RelayClient(api, token=str(session.get("session_token") or ""))
+
+    def relay_pick_node(self) -> dict:
+        """按在线节点负载选择节点，供自动开房使用。"""
+        nodes = self.relay_nodes()
+        online = [node for node in nodes if node.get("online", True) and node.get("api")]
+        if not online:
+            raise relay_engine.RelayError("联机服务暂无在线节点")
+        return min(
+            online,
+            key=lambda node: (
+                (int(node.get("rooms") or 0) / max(1, int(node.get("max_rooms") or 1))),
+                int(node.get("rooms") or 0),
+            ),
+        )
+
+    def relay_rooms(self, limit: int = 60) -> list[dict]:
+        """汇总各节点的公开房间（隐藏房间只由服务端排除）。"""
+        nodes = self.relay_nodes()
+        errors: list[str] = []
+
+        def fetch(node: dict) -> tuple[str, list[dict]]:
+            api = str(node.get("api") or "")
+            if not api:
+                return api, []
+            client = self._relay_client(api)
+            return api, client.list_rooms()[:limit]
+
+        results: list[tuple[str, list[dict]]] = []
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(nodes)))) as pool:
+            futures = [pool.submit(fetch, node) for node in nodes if node.get("api")]
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except relay_engine.RelayError as exc:
+                    errors.append(str(exc))
+        room_list: list[dict] = []
+        node_names = {str(node.get("api")): node.get("name") or node.get("id") for node in nodes}
+        for api, items in results:
+            for room in items:
+                if not isinstance(room, dict):
+                    continue
+                room["api"] = api
+                room["node_name"] = node_names.get(api, "")
+                room_list.append(room)
+        if not results and errors:
+            raise relay_engine.RelayError(errors[0])
+        return room_list
+
+    def relay_room_info(self, api: str, room_id: str) -> dict:
+        return self._relay_client(api).room_info(room_id)
+
+    def relay_create_room(
+        self,
+        api: str = "",
+        *,
+        name: str,
+        version: str,
+        loader: str,
+        max_players: int,
+        local_port: int,
+        provider: str = "aml",
+        hidden: bool = False,
+        mods: Optional[list[dict]] = None,
+        mods_declared: bool = False,
+    ) -> dict:
+        if not api:
+            api = str(self.relay_pick_node().get("api") or "")
+        if not (1024 <= int(local_port) <= 65535):
+            raise relay_engine.RelayError("本地端口不合法")
+        # 只允许把真正的 Minecraft 服务打进隧道，防止隧道被用于其他 TCP 服务。
+        if not relay_engine.probe_minecraft(int(local_port)):
+            raise relay_engine.RelayError(
+                "所选端口不是 Minecraft 服务，请先在游戏内对局域网开放后重试"
+            )
+        client = self._relay_client(api)
+        room = client.create_room(
+            {
+                "name": name,
+                "version": version,
+                "loader": loader,
+                "max_players": int(max_players),
+                "local_port": int(local_port),
+                "mode": "stcp",
+                "provider": provider,
+                "hidden": bool(hidden),
+                "mods": list(mods or []),
+                "mods_declared": bool(mods_declared or mods),
+            }
+        )
+        room["api"] = api
+        self._relay_runner.start(
+            "host", f"room-{room['room_id']}", room["host_frpc"]
+        )
+        self._relay_room = room
+        self._relay_guest = None
+        self.log(
+            f"联机：已创建房间 {room.get('join_code')}"
+            f"（{'隐藏' if hidden else '公开'}，上限 {max_players} 人）"
+        )
+        return room
+
+    def relay_find_room(self, code: str) -> tuple[str, dict]:
+        """按 4 位房间号在各节点中查找房间。"""
+        raw = "".join(ch for ch in str(code or "") if ch.isdigit())
+        if len(raw) != 4:
+            raise relay_engine.RelayError("请输入 4 位数字房间号")
+        errors: list[str] = []
+        for node in self.relay_nodes():
+            api = str(node.get("api") or "")
+            if not api:
+                continue
+            try:
+                return api, self._relay_client(api).lookup(raw)
+            except relay_engine.RelayError as exc:
+                if exc.code in ("404", "410"):
+                    continue
+                errors.append(str(exc))
+        if errors:
+            raise relay_engine.RelayError(errors[0])
+        raise relay_engine.RelayError("房间不存在或已过期", code="404")
+
+    def relay_join_room(self, api: str, room_id: str, *, bind_port: int = 0) -> dict:
+        port = int(bind_port) or relay_engine.pick_free_port()
+        client = self._relay_client(api)
+        result = client.join(room_id, bind_port=port)
+        self._relay_runner.start(
+            "guest", f"guest-{room_id}", result["visitor_frpc"], bind_port=port
+        )
+        entry = {
+            "api": api,
+            "room_id": room_id,
+            "room": result.get("room") or {},
+            "connect": f"127.0.0.1:{port}",
+            "bind_port": port,
+        }
+        self._relay_guest = entry
+        self._relay_room = None
+        self.log(f"联机：已加入房间 {entry['room'].get('join_code') or room_id}")
+        return entry
+
+    def relay_heartbeat(self, api: str, room_id: str) -> dict:
+        return self._relay_client(api).heartbeat(room_id)
+
+    def relay_room_detail(self) -> dict:
+        if not self._relay_room:
+            return {}
+        return self._relay_client(self._relay_room["api"]).detail(self._relay_room["room_id"])
+
+    def relay_leave_room(self) -> None:
+        guest = self._relay_guest
+        self._relay_runner.stop()
+        self._relay_guest = None
+        if not guest:
+            return
+        try:
+            relay_engine.RelayClient(
+                guest["api"], token=str(self.relay_session(guest["api"]).get("session_token") or "")
+            ).leave(guest["room_id"])
+        except relay_engine.RelayError as exc:
+            self.log(f"联机：退出房间时服务端返回异常（{exc}）")
+        self.log("联机：已退出房间")
+
+    def relay_close_room(self) -> None:
+        room = self._relay_room
+        self._relay_runner.stop()
+        self._relay_room = None
+        if not room:
+            return
+        try:
+            relay_engine.RelayClient(
+                room["api"], token=str(self.relay_session(room["api"]).get("session_token") or "")
+            ).close(room["room_id"])
+        except relay_engine.RelayError as exc:
+            self.log(f"联机：关闭房间时服务端返回异常（{exc}）")
+        self.log("联机：已关闭房间")
+
+    def relay_status(self) -> dict:
+        return {
+            "tunnel": self._relay_runner.status(),
+            "room": self._relay_room,
+            "guest": self._relay_guest,
+            "master": self.relay_master(),
+        }
+
+    # ---- 局域网端口 / 模组清单 / 启动参数 ----
+
+    def relay_lan_port(self, version: str, *, default: int = 25565) -> int:
+        """读取当前版本 latest.log 中“对局域网开放”的端口。"""
+        if not version:
+            return 0
+        paths = self.paths()
+        isolated = bool(self.config.merged_settings(version).get("isolated"))
+        log_path = paths.version_game_dir(version, isolated=isolated) / "logs" / "latest.log"
+        return relay_engine.detect_lan_port(log_path, default=default)
+
+    def relay_scan_ports(self) -> dict:
+        """扫描正在监听的 Minecraft 端口（不依赖是否由本启动器启动）。"""
+        info = self.running_game_info()
+        version = str(info.get("version") or "")
+        log_port = self.relay_lan_port(version, default=0) if version else 0
+        ports = relay_engine.scan_minecraft_ports(log_port or None)
+        return {
+            "running": bool(info),
+            "version": version,
+            "pid": info.get("pid"),
+            "log_port": log_port,
+            "ports": ports,
+        }
+
+    def relay_local_mods(self, version_id: str) -> list[dict]:
+        """当前客户端已启用的 Mod 清单（用于开房时上传）。"""
+        result = []
+        for item in self.content_list(CONTENT_MOD, version_id):
+            if not item.get("enabled"):
+                continue
+            filename = str(item.get("filename") or "")
+            if not filename.lower().endswith(".jar"):
+                continue
+            result.append(
+                {
+                    "filename": filename,
+                    "name": item.get("display_name") or filename,
+                    "version": item.get("mod_version") or "",
+                    "sha1": item.get("sha1") or "",
+                    "mod_id": item.get("mod_id") or "",
+                    "enabled": True,
+                }
+            )
+        return result
+
+    def relay_resolve_mods(self, mods: list[dict]) -> dict:
+        """按 SHA1 反查 Modrinth（可选 CurseForge），补齐链接与下载地址。"""
+        items = [dict(item) for item in mods if isinstance(item, dict)]
+
+        def lookup(item: dict) -> dict:
+            sha1 = str(item.get("sha1") or "").strip().lower()
+            if sha1:
+                try:
+                    status, payload = net.get_json_auth(
+                        f"{MODRINTH_API}/version_file/{sha1}", timeout=8
+                    )
+                    if status == 200 and isinstance(payload, dict):
+                        project_id = str(payload.get("project_id") or "")
+                        if project_id:
+                            item["modrinth_url"] = f"https://modrinth.com/project/{project_id}"
+                        files = payload.get("files") or []
+                        for file in files:
+                            if not isinstance(file, dict):
+                                continue
+                            if not item.get("download_url") or file.get("primary"):
+                                item["download_url"] = str(file.get("url") or "")
+                                item["filename"] = str(
+                                    file.get("filename") or item.get("filename") or ""
+                                )
+                                if file.get("primary"):
+                                    break
+                except Exception:  # noqa: BLE001 - 查询失败不影响开房
+                    pass
+            return item
+
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as pool:
+            resolved = list(pool.map(lookup, items)) if items else []
+        found = sum(1 for item in resolved if item.get("modrinth_url") or item.get("curseforge_url"))
+        return {"mods": resolved, "found": found, "missing": len(resolved) - found}
+
+    def relay_join_options(self, host_mods: list[dict]) -> list[dict]:
+        """把房主 Mod 清单与本机各客户端比对，供加入房间时选择。"""
+        host_mods = [item for item in (host_mods or []) if isinstance(item, dict)]
+        options = []
+        for version in self.local_versions():
+            version_id = str(version.get("id") or "")
+            local = self.relay_local_mods(version_id) if version_id else []
+            host_sha = {str(item.get("sha1") or "").lower() for item in host_mods if item.get("sha1")}
+            host_files = {
+                Path(str(item.get("filename") or "")).name.lower()
+                for item in host_mods
+                if item.get("filename")
+            }
+            local_sha = {str(item.get("sha1") or "").lower() for item in local if item.get("sha1")}
+            local_files = {Path(str(item.get("filename") or "")).name.lower() for item in local}
+            missing = [
+                item
+                for item in host_mods
+                if not (
+                    (item.get("sha1") and str(item.get("sha1")).lower() in local_sha)
+                    or (
+                        item.get("filename")
+                        and Path(str(item.get("filename"))).name.lower() in local_files
+                    )
+                )
+            ]
+            extra = [
+                item
+                for item in local
+                if not (
+                    (item.get("sha1") and str(item.get("sha1")).lower() in host_sha)
+                    or Path(str(item.get("filename") or "")).name.lower() in host_files
+                )
+            ]
+            options.append(
+                {
+                    "version": version_id,
+                    "game_version": version.get("game_version") or "",
+                    "loader": version.get("loader") or "vanilla",
+                    "match": not missing and not extra,
+                    "missing": missing,
+                    "extra": extra,
+                    "host_count": len(host_mods),
+                    "local_count": len(local),
+                }
+            )
+        return options
+
+    def relay_download_missing(self, version_id: str, mods: list[dict]) -> dict:
+        """下载缺失 Mod 到指定客户端（仅处理带下载地址的条目）。"""
+        installed: list[str] = []
+        skipped: list[dict] = []
+        temp_dir = Path(tempfile.mkdtemp(prefix="aml-relay-mod-"))
+        try:
+            for item in mods:
+                url = str(item.get("download_url") or "").strip()
+                filename = str(item.get("filename") or "").strip()
+                if not url or not filename:
+                    skipped.append(
+                        {
+                            "filename": filename or item.get("name") or "未知 Mod",
+                            "reason": "未找到下载地址",
+                        }
+                    )
+                    continue
+                dest = temp_dir / Path(filename).name
+                try:
+                    net.download_file(url, dest, timeout=30, retries=2)
+                    sha1 = str(item.get("sha1") or "").lower()
+                    if sha1 and mod_info.cached_sha1(dest).lower() != sha1:
+                        skipped.append({"filename": filename, "reason": "SHA1 校验失败"})
+                        continue
+                    self.content_import(
+                        CONTENT_MOD, str(dest), version_id=version_id, filename=dest.name
+                    )
+                    installed.append(dest.name)
+                except Exception as exc:  # noqa: BLE001 - 单个 Mod 失败继续处理其他
+                    skipped.append({"filename": filename, "reason": str(exc)})
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return {"installed": installed, "skipped": skipped}
+
+    def relay_launch_args(self, version_id: str, port: int) -> dict:
+        """返回启动参数与是否支持自动进服。"""
+        profile = self.version_profile(version_id)
+        game_version = str(profile.get("game_version") or "")
+        return {
+            "args": relay_engine.launch_connect_args(game_version, int(port)),
+            "auto": relay_engine.supports_auto_connect(game_version),
+            "game_version": game_version,
+        }
 
     def supports(self) -> dict:
         """供界面判断哪些能力可用（避免前端硬编码）。"""

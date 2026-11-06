@@ -14,3 +14,9 @@ dist/
 .trae/
 .idea/
 *.log
+
+# 联机主节点地址与内置二进制，不入库
+relay_endpoint.txt
+frpc.exe
+frpc.zip
+frpc.7z

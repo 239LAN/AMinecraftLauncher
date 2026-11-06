@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,10 +24,25 @@ from engine.version import APP_NAME, APP_VERSION
 
 from .services import LauncherService
 
+def _relay_ui_task(func):
+    """让由 background_tasks 触发的联机异步方法仍能在页面插槽中创建 UI。"""
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        key = "relay-create" if self.current_view == "relay-create" else "multiplayer"
+        slot = self.pages.get(key) or self.pages.get("multiplayer")
+        if slot is None:
+            return await func(self, *args, **kwargs)
+        with slot:
+            return await func(self, *args, **kwargs)
+
+    return wrapper
+
+
 NAV_ITEMS = [
     ("home", "home", "启动"),
     ("versions", "inventory_2", "版本"),
     ("download", "cloud_download", "下载"),
+    ("multiplayer", "groups", "联机"),
     ("settings", "settings", "设置"),
 ]
 
@@ -35,6 +51,34 @@ FOOTER_CURRENT = "> 最低系统要求： Windows 10(22H2)及以上。"
 FOOTER_LEGACY = "> 暂仅支持离线登录；最低系统要求： Windows 10(22H2)及以上。"
 
 CHANGELOG = [
+    {
+        "version": "1.5.0",
+        "title": "联机",
+        "notes": """\
+### 新增
+- 新增联机页：无需正版账号即可创建房间，好友输入房间码即可加入
+- 联机页改为搜索框 + 公开房间卡片列表，右上角显示「我的房间」
+- 房间号改为 4 位不重复数字，隐藏房间不出现在列表，仅能凭房间号搜索
+- 同一网络同时只能开一个房间，接口只接受启动器签名请求
+- 创建房间进入独立页面：选择服务商、扫描并选择游戏端口、2-16 人滑块、隐藏房间开关
+- 支持读取或上传模组清单，并自动查询 Modrinth 链接
+- 加入前比对客户端模组；一致则自动启动并进入服务器，不一致可下载缺失 Mod 或忽略风险加入
+- 基于 frp STCP 隧道，访客连接本机回环地址，公网只暴露 API 与 frps 端口
+- 仅允许真正 Minecraft 端口进入隧道，并限制房间号查询频率
+- 支持多节点部署：主节点下发可用节点，启动器自动选择
+- 自动读取游戏「对局域网开放」的端口，无需手动填写
+- frpc 随安装包内置，无需单独安装或下载
+
+### 调整
+- frps 强制 TLS、限制每客户端代理数量与远程端口段，降低隧道滥用风险
+- 公开接口不再返回 frps 地址
+- 最大房间人数上限调整为 16
+- 客户端隧道组件与服务端版本对齐
+
+### 修复
+- 无
+""",
+    },
     {
         "version": "1.4.2",
         "title": "头像与界面精简",
@@ -904,6 +948,32 @@ class LauncherUI:
         self._launch_done = False
         self._launch_error = ""
         self._log_revision = -1
+        # 联机页状态（服务层是唯一事实来源，这里只缓存控件引用）。
+        self.relay_body = None
+        self.relay_my_room_button = None
+        self.relay_search_input = None
+        self.relay_heartbeat_timer = None
+        self.relay_players_label = None
+        self.relay_tunnel_label = None
+        self.relay_tick_timer = None
+        self._relay_rooms: Optional[list[dict]] = None
+        self._relay_rooms_loading = False
+        self._relay_rooms_error = ""
+        # 创建房间独立页
+        self.relay_create_body = None
+        self._relay_create_ports: list[dict] = []
+        self._relay_create_version = ""
+        self._relay_create_mods: list[dict] = []
+        self._relay_create_mods_found = 0
+        self._relay_create_mods_missing = 0
+        self.relay_create_name = None
+        self.relay_create_provider = None
+        self.relay_create_port = None
+        self.relay_create_players = None
+        self.relay_create_players_label = None
+        self.relay_create_hidden = None
+        self.relay_create_mods_label = None
+        self.relay_create_primary = None
 
     # ===================================================================== 骨架
     async def build(self) -> None:
@@ -1062,6 +1132,8 @@ class LauncherUI:
             self._build_download_page()
             self._build_tasks_page()
             self._build_settings_page()
+            self._build_multiplayer_page()
+            self._build_relay_create_page()
 
     def _build_log_drawer(self) -> None:
         with ui.column().classes(
@@ -1189,7 +1261,7 @@ class LauncherUI:
         for name, page in self.pages.items():
             page.set_visibility(name == key)
         # 任务页从下载页进入，导航上保持「下载」高亮。
-        active_key = "download" if key == "tasks" else key
+        active_key = "download" if key == "tasks" else ("multiplayer" if key == "relay-create" else key)
         for name, button in self.nav_buttons.items():
             button.classes(add="active" if name == active_key else None, remove=None if name == active_key else "active")
 
@@ -1214,6 +1286,11 @@ class LauncherUI:
                         self._build_download_body()
         elif key == "tasks":
             self._render_tasks()
+        elif key == "multiplayer":
+            self._render_relay_body()
+            background_tasks.create(self._refresh_relay_rooms())
+        elif key == "relay-create":
+            self._render_relay_create_page()
 
     # ==================================================================== 启动
     def _build_home_page(self) -> None:
@@ -4484,6 +4561,7 @@ class LauncherUI:
         username: str,
         account_id: Optional[str] = None,
         inline: bool = False,
+        extra_game: Optional[list[str]] = None,
     ) -> None:
         if not inline and (self._launch_timer.active or self._home_launching):
             ui.notify("正在启动中，请稍候", type="warning", position="top-right")
@@ -4503,10 +4581,20 @@ class LauncherUI:
             self._apply_launch_progress()
             self.launch_dialog.open()
             self._launch_timer.active = True
-        background_tasks.create(self._run_launch(version, username, account_id, inline=inline))
+        background_tasks.create(
+            self._run_launch(
+                version, username, account_id, inline=inline, extra_game=extra_game
+            )
+        )
 
     async def _run_launch(
-        self, version: str, username: str, account_id: Optional[str], *, inline: bool = False
+        self,
+        version: str,
+        username: str,
+        account_id: Optional[str],
+        *,
+        inline: bool = False,
+        extra_game: Optional[list[str]] = None,
     ) -> None:
         def on_progress(event: dict) -> None:
             self._launch_progress = {
@@ -4523,6 +4611,7 @@ class LauncherUI:
                     account_id=account_id,
                     progress=on_progress,
                     cancel=self._launch_cancel.is_set,
+                    extra_game=extra_game,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -4537,6 +4626,929 @@ class LauncherUI:
             self._finish_home_launch("")
             return
         self._launch_done = True
+
+
+    # =================================================================== 联机
+    def _build_multiplayer_page(self) -> None:
+        with ui.column().classes("w-full h-full p-5 gap-3 aml-scroll") as page:
+            self.pages["multiplayer"] = page
+            page.props("id=aml-page-multiplayer")
+            page.set_visibility(False)
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                with ui.column().classes("gap-0 no-wrap"):
+                    ui.label("联机").classes("text-[18px] font-semibold")
+                    self.relay_sub = ui.label("").classes("aml-sub")
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    self.relay_my_room_button = ui.button(
+                        "我的房间", on_click=self._relay_open_host_dialog
+                    ).props("unelevated dense no-caps color=primary")
+                    self.relay_my_room_button.set_visibility(False)
+
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                self.relay_search_input = ui.input(
+                    placeholder="输入 4 位房间号搜索"
+                ).props("dense outlined").classes("w-[320px]")
+                self.relay_search_input.on(
+                    "keydown.enter", lambda _: background_tasks.create(self._relay_search_room())
+                )
+                ui.button(
+                    "搜索", icon="search",
+                    on_click=lambda: background_tasks.create(self._relay_search_room()),
+                ).props("unelevated dense no-caps color=primary")
+                ui.button(
+                    icon="refresh",
+                    on_click=lambda: background_tasks.create(self._refresh_relay_rooms(force=True)),
+                ).props("flat dense round size=sm").tooltip("刷新房间列表")
+
+            self.relay_body = ui.column().classes("w-full gap-3")
+            self.relay_tick_timer = ui.timer(2.0, self._relay_tick)
+            self._render_relay_body()
+
+    def _build_relay_create_page(self) -> None:
+        with ui.column().classes("w-full h-full p-5 gap-3 aml-scroll") as page:
+            self.pages["relay-create"] = page
+            page.props("id=aml-page-relay-create")
+            page.set_visibility(False)
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.button(
+                    icon="arrow_back", on_click=lambda: self._select_view("multiplayer")
+                ).props("flat dense round size=sm").tooltip("返回联机")
+                with ui.column().classes("gap-0 no-wrap"):
+                    ui.label("创建联机房间").classes("text-[18px] font-semibold")
+                    ui.label("选择服务商、端口与人数上限，生成 4 位房间号").classes("aml-sub")
+            self.relay_create_body = ui.column().classes("w-full gap-3")
+            self._render_relay_create_page()
+
+    def _render_relay_body(self, *, notify: str = "") -> None:
+        if self.relay_body is None:
+            return
+        self.relay_body.clear()
+        self.relay_players_label = None
+        self.relay_tunnel_label = None
+        master = self.service.relay_master()
+        self.relay_sub.text = "子节点由主节点自动分配" if master else "联机服务不可用"
+        status = self.service.relay_status()
+        host_room = status.get("room")
+        guest = status.get("guest")
+        if self.relay_my_room_button is not None:
+            if host_room:
+                code = str(host_room.get("join_code") or "")
+                self.relay_my_room_button.text = f"我的房间 {code}"
+                self.relay_my_room_button.set_visibility(True)
+            else:
+                self.relay_my_room_button.set_visibility(False)
+
+        with self.relay_body:
+            if not master:
+                with ui.card().classes("aml-card w-full p-5 gap-1"):
+                    ui.label("尚未配置联机主节点").classes("text-[15px] font-semibold")
+                    ui.label(
+                        "点击右上角齿轮填写主节点地址，例如 https://relay.example.com:3380"
+                    ).classes("aml-sub")
+                with ui.row().classes("w-full gap-3 flex-wrap items-stretch"):
+                    self._render_create_card()
+                if notify:
+                    ui.notify(notify, type="positive")
+                return
+
+            if guest:
+                self._render_guest_room(guest, status.get("tunnel") or {})
+
+            with ui.row().classes("w-full gap-3 flex-wrap items-stretch"):
+                self._render_create_card()
+                self._render_room_list()
+            if notify:
+                ui.notify(notify, type="positive")
+
+    def _render_create_card(self) -> None:
+        with ui.card().classes(
+            "aml-card p-4 gap-1 w-[240px] min-h-[132px] items-center justify-center cursor-pointer"
+        ).on("click", lambda: background_tasks.create(self._relay_start_create())):
+            ui.icon("add_circle_outline").classes("text-[30px]").style(
+                "color: var(--aml-primary, #2563eb)"
+            )
+            ui.label("创建房间").classes("text-[15px] font-semibold")
+            ui.label("先启动游戏并对局域网开放").classes("aml-sub text-center")
+
+    def _render_room_list(self) -> None:
+        if self._relay_rooms is None:
+            with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px] items-center justify-center"):
+                ui.spinner(size="22px")
+                ui.label("正在加载房间…" if self._relay_rooms_loading else "暂无房间数据").classes(
+                    "aml-sub"
+                )
+            return
+        if self._relay_rooms_error:
+            with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px] items-center justify-center"):
+                ui.icon("cloud_off").classes("text-[26px]").style("color: var(--aml-muted)")
+                ui.label(self._relay_rooms_error).classes("aml-sub text-center")
+            return
+        if not self._relay_rooms:
+            with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px] items-center justify-center"):
+                ui.icon("meeting_room").classes("text-[26px]").style("color: var(--aml-muted)")
+                ui.label("暂无公开房间").classes("aml-sub")
+            return
+        for room in self._relay_rooms:
+            self._render_room_card(room)
+
+    def _render_room_card(self, room: dict) -> None:
+        players = int(room.get("players") or 1)
+        limit = int(room.get("max_players") or 8)
+        version = str(room.get("version") or "未知")
+        loader = str(room.get("loader") or "vanilla")
+        mods = int(room.get("mod_count") or 0)
+        with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px]"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label(str(room.get("name") or "未命名房间")).classes(
+                    "text-[15px] font-semibold truncate"
+                )
+                ui.label(f"{players}/{limit}").classes("aml-chip primary")
+            ui.label(f"房主：{room.get('host_name') or '未知'}").classes("aml-sub")
+            ui.label(f"{version} · {loader}").classes("aml-sub truncate")
+            extra = f" · {mods} 个 Mod" if mods else ""
+            ui.label(f"节点：{room.get('node_name') or room.get('node_id') or '未知'}{extra}").classes(
+                "aml-sub truncate"
+            )
+            ui.button(
+                "加入房间",
+                on_click=lambda r=room: background_tasks.create(self._relay_begin_join(r)),
+            ).props("unelevated dense no-caps color=primary").classes("w-full mt-1")
+
+    def _render_guest_room(self, guest: dict, tunnel: dict) -> None:
+        summary = guest.get("room") or {}
+        connect = str(guest.get("connect") or "")
+        with ui.card().classes("aml-card w-full p-5 gap-2"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                with ui.column().classes("gap-0 no-wrap"):
+                    ui.label("已加入房间").classes("aml-sub")
+                    ui.label(str(summary.get("name") or guest.get("room_id") or "")).classes(
+                        "text-[16px] font-semibold"
+                    )
+                ui.button("退出房间", on_click=self._relay_leave_room).props(
+                    "flat dense no-caps"
+                )
+            with ui.row().classes("items-center gap-3 no-wrap"):
+                ui.label(connect).classes("text-[22px] font-semibold").style(
+                    "font-family: Consolas, monospace"
+                )
+                ui.button(
+                    "复制地址", on_click=lambda: self._copy(connect, "连接地址已复制")
+                ).props("unelevated dense no-caps color=primary")
+            ui.label("游戏会通过本机回环地址自动进入服务器，不会暴露房主或节点 IP。").classes(
+                "aml-sub"
+            )
+            self.relay_tunnel_label = ui.label("").classes("aml-sub")
+            self._sync_relay_labels(None, tunnel)
+
+    def _sync_relay_labels(self, room: Optional[dict], tunnel: dict) -> None:
+        if self.relay_tunnel_label is not None:
+            self.relay_tunnel_label.text = (
+                "隧道已连接" if tunnel.get("running") else "隧道未运行"
+            )
+        if room and self.relay_players_label is not None:
+            self.relay_players_label.text = f"在线玩家：{room.get('players') or 1} 人"
+
+    async def _relay_tick(self) -> None:
+        if self.current_view != "multiplayer" or self.relay_tunnel_label is None:
+            return
+        tunnel = self.service.relay_status().get("tunnel") or {}
+        self.relay_tunnel_label.text = "隧道已连接" if tunnel.get("running") else "隧道未运行"
+
+    @_relay_ui_task
+    async def _refresh_relay_rooms(self, *, force: bool = False) -> None:
+        if self.relay_body is None:
+            return
+        if not self.service.relay_master():
+            self._relay_rooms = []
+            self._relay_rooms_error = ""
+            self._render_relay_body()
+            return
+        if self._relay_rooms_loading:
+            return
+        self._relay_rooms_loading = True
+        self._relay_rooms_error = ""
+        self._render_relay_body()
+        try:
+            rooms = await run.io_bound(self.service.relay_rooms)
+            self._relay_rooms = rooms
+        except Exception as exc:  # noqa: BLE001
+            self._relay_rooms = []
+            self._relay_rooms_error = f"房间列表加载失败：{exc}"
+        finally:
+            self._relay_rooms_loading = False
+        if self.current_view in ("multiplayer", "relay-create"):
+            self._render_relay_body()
+
+    @_relay_ui_task
+    async def _relay_search_room(self) -> None:
+        code = "".join(ch for ch in str(self.relay_search_input.value or "") if ch.isdigit())
+        if len(code) != 4:
+            ui.notify("请输入完整的 4 位房间号", type="warning")
+            return
+        ui.notify("正在查找房间…")
+        try:
+            api, summary = await run.io_bound(self.service.relay_find_room, code)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"查找失败：{exc}", type="negative")
+            return
+        await self._relay_join_dialog(api, summary)
+
+    @_relay_ui_task
+    async def _relay_begin_join(self, room: dict) -> None:
+        api = str(room.get("api") or "")
+        room_id = str(room.get("room_id") or "")
+        if not api or not room_id:
+            ui.notify("房间信息不完整，请刷新后重试", type="negative")
+            return
+        ui.notify("正在读取房间信息…")
+        try:
+            summary = await run.io_bound(self.service.relay_room_info, api, room_id)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"读取房间失败：{exc}", type="negative")
+            return
+        await self._relay_join_dialog(api, summary)
+
+    @_relay_ui_task
+    async def _relay_join_dialog(self, api: str, summary: dict, *, retry: bool = False) -> None:
+        host_mods = summary.get("mods") or []
+        declared = bool(summary.get("mods_declared"))
+        try:
+            options = await run.io_bound(self.service.relay_join_options, host_mods)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"检查模组失败：{exc}", type="negative")
+            return
+        state = {"version": "", "option": None}
+
+        def best_option() -> dict:
+            for item in options:
+                if item.get("match"):
+                    return item
+            return options[0] if options else {
+                "version": "",
+                "match": False,
+                "missing": [],
+                "extra": [],
+                "local_count": 0,
+                "host_count": len(host_mods),
+            }
+
+        chosen = best_option()
+        state["version"] = str(chosen.get("version") or "")
+        state["option"] = chosen
+
+        with ui.dialog() as dialog, ui.card().classes(
+            "w-[620px] max-h-[82vh] overflow-auto gap-3"
+        ):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                with ui.column().classes("gap-0 no-wrap"):
+                    ui.label("加入房间").classes("text-[18px] font-semibold")
+                    ui.label(str(summary.get("name") or "未命名房间")).classes("aml-sub")
+                ui.label(
+                    f"{summary.get('players') or 1}/{summary.get('max_players') or 8} 人"
+                ).classes("aml-chip primary")
+
+            with ui.column().classes("w-full gap-0"):
+                ui.label(
+                    f"房主 {summary.get('host_name') or '未知'} · "
+                    f"{summary.get('version') or '未知版本'} · {summary.get('loader') or 'vanilla'}"
+                ).classes("aml-sub")
+                ui.label(
+                    f"服务商 {summary.get('provider') or 'aml'} · 节点 {summary.get('node_id') or '未知'}"
+                ).classes("aml-sub")
+
+            details = ui.column().classes("w-full gap-2")
+
+            def render_details() -> None:
+                details.clear()
+                option = state.get("option") or {}
+                with details:
+                    if not declared:
+                        ui.label("房主未上传模组清单，将跳过模组校验直接启动。").classes(
+                            "aml-sub"
+                        )
+                    elif options and option.get("match"):
+                        ui.label("本机客户端与房主模组一致，可以自动启动并进入服务器。").classes(
+                            "text-[13px]"
+                        ).style("color: #16a34a")
+                    else:
+                        missing = option.get("missing") or []
+                        extra = option.get("extra") or []
+                        ui.label(
+                            f"模组不一致：缺少 {len(missing)} 个，多出 {len(extra)} 个。"
+                            "继续加入可能被服务器拒绝或出现异常。"
+                        ).classes("text-[13px]").style("color: #d97706")
+                        for item in missing[:8]:
+                            name = str(item.get("filename") or item.get("name") or "未知 Mod")
+                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                                ui.label(name).classes("aml-sub truncate flex-1")
+                                if item.get("modrinth_url"):
+                                    ui.link("Modrinth", item["modrinth_url"]).classes("text-[12px]")
+                                if item.get("curseforge_url"):
+                                    ui.link("CurseForge", item["curseforge_url"]).classes(
+                                        "text-[12px]"
+                                    )
+                                if not (item.get("modrinth_url") or item.get("curseforge_url")):
+                                    ui.label("无链接").classes("aml-sub")
+                        if len(missing) > 8:
+                            ui.label(f"其余 {len(missing) - 8} 个已省略").classes("aml-sub")
+                        unresolved = [
+                            item
+                            for item in missing
+                            if not (item.get("modrinth_url") or item.get("curseforge_url"))
+                        ]
+                        if unresolved:
+                            ui.label(
+                                f"有 {len(unresolved)} 个 Mod 查不到链接，成员需自行安装或禁用后加入。"
+                            ).classes("aml-sub")
+
+            version_options = {
+                str(item.get("version")): (
+                    f"{item.get('version')} · {item.get('game_version') or ''}"
+                    + (" · 一致" if item.get("match") else "")
+                )
+                for item in options
+            }
+            with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                version_select = ui.select(
+                    version_options,
+                    value=state["version"] or None,
+                    label="选择启动的客户端",
+                ).props("dense outlined").classes("flex-1")
+                if not options:
+                    ui.label("本机没有已安装客户端").classes("aml-sub")
+            render_details()
+
+            def on_version_change(_=None) -> None:
+                version = str(version_select.value or "")
+                state["version"] = version
+                state["option"] = next(
+                    (item for item in options if str(item.get("version")) == version), None
+                )
+                render_details()
+
+            async def download_missing() -> None:
+                option = state.get("option") or {}
+                missing = option.get("missing") or []
+                version = state.get("version") or ""
+                if not version:
+                    ui.notify("请先选择客户端", type="warning")
+                    return
+                if not missing:
+                    ui.notify("没有缺失的 Mod")
+                    return
+                ui.notify("正在下载缺失 Mod…")
+                try:
+                    result = await run.io_bound(
+                        self.service.relay_download_missing, version, missing
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"下载失败：{exc}", type="negative")
+                    return
+                installed = result.get("installed") or []
+                skipped = result.get("skipped") or []
+                msg = f"已安装 {len(installed)} 个 Mod"
+                if skipped:
+                    msg += f"，{len(skipped)} 个未安装"
+                ui.notify(msg, type="positive" if not skipped else "warning")
+                dialog.close()
+                await self._relay_join_dialog(api, summary, retry=True)
+
+            async def do_join() -> None:
+                option = state.get("option") or {}
+                version = state.get("version") or ""
+                mismatch = declared and bool(options) and not option.get("match")
+                if mismatch:
+                    dialog.close()
+                    # 确认框挂在联机页插槽上，避免嵌入已关闭的对话框导致不可见。
+                    with self.pages["multiplayer"]:
+                        with ui.dialog() as confirm, ui.card().classes("w-[420px] gap-3"):
+                            ui.label("模组不一致").classes("text-[16px] font-semibold")
+                            ui.label(
+                                "继续加入将使用当前客户端，服务器可能拒绝连接或出现异常。是否继续？"
+                            ).classes("aml-sub")
+                            with ui.row().classes("w-full justify-end gap-2"):
+                                ui.button("取消", on_click=confirm.close).props(
+                                    "flat dense no-caps"
+                                )
+
+                                async def confirm_join() -> None:
+                                    confirm.close()
+                                    await self._relay_do_join(
+                                        api, summary, version, launch=bool(version)
+                                    )
+
+                                ui.button("忽略风险并加入", on_click=confirm_join).props(
+                                    "unelevated dense no-caps color=warning"
+                                )
+                    confirm.open()
+                    return
+                dialog.close()
+                await self._relay_do_join(api, summary, version, launch=bool(version))
+
+            async def join_only() -> None:
+                dialog.close()
+                await self._relay_do_join(api, summary, state.get("version") or "", launch=False)
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=dialog.close).props("flat dense no-caps")
+                ui.button("仅加入（不启动）", on_click=join_only).props("flat dense no-caps")
+                download_button = ui.button(
+                    "下载缺失 Mod", on_click=download_missing
+                ).props("flat dense no-caps")
+                primary_button = ui.button("启动并加入", on_click=do_join).props(
+                    "unelevated dense no-caps color=primary"
+                )
+
+            def sync_buttons() -> None:
+                option = state.get("option") or {}
+                missing = option.get("missing") or []
+                download_button.set_visibility(bool(missing))
+                matched = not declared or bool(option.get("match"))
+                primary_button.text = "启动并加入" if matched else "仍然加入"
+
+            sync_buttons()
+            version_select.on_value_change(
+                lambda _: (on_version_change(), sync_buttons())
+            )
+        dialog.open()
+
+    @_relay_ui_task
+    async def _relay_do_join(
+        self, api: str, summary: dict, version: str, *, launch: bool
+    ) -> None:
+        account = self._active_account() if launch else None
+        if launch and not version:
+            ui.notify("本机没有可启动的客户端，请安装后再加入", type="warning")
+            return
+        if launch and not account:
+            ui.notify("请先登录正版账号后再启动客户端", type="warning")
+            return
+        ui.notify("正在建立联机隧道…")
+        try:
+            entry = await run.io_bound(
+                lambda: self.service.relay_join_room(api, str(summary.get("room_id") or ""))
+            )
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"加入房间失败：{exc}", type="negative")
+            return
+        self._render_relay_body(notify="已加入房间")
+        if not launch or not account:
+            return
+        info = self.service.relay_launch_args(version, int(entry.get("bind_port") or 0))
+        if not info.get("auto"):
+            ui.notify(
+                "当前游戏版本不支持自动进服，请在多人游戏中添加 "
+                f"127.0.0.1:{entry.get('bind_port')}",
+                type="warning",
+            )
+        await self._launch(
+            version,
+            username=str(account.get("name") or ""),
+            account_id=account.get("id"),
+            extra_game=info.get("args") or [],
+        )
+
+    @_relay_ui_task
+    async def _relay_open_host_dialog(self) -> None:
+        room = self.service.relay_status().get("room")
+        if not room:
+            ui.notify("当前没有进行中的房间", type="warning")
+            return
+        try:
+            detail = await run.io_bound(self.service.relay_room_detail)
+        except Exception:  # noqa: BLE001
+            detail = room
+        code = str(detail.get("join_code") or room.get("join_code") or "")
+        hidden = bool(detail.get("hidden"))
+        guests = detail.get("guests") or []
+        with ui.dialog() as dialog, ui.card().classes("w-[480px] gap-3"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label("我的房间").classes("text-[16px] font-semibold")
+                ui.button("关闭房间", on_click=lambda: background_tasks.create(
+                    self._relay_close_room_dialog(dialog)
+                )).props("flat dense no-caps")
+            ui.label(code).classes("text-[36px] font-semibold text-center w-full").style(
+                "font-family: Consolas, monospace; letter-spacing: .18em"
+            )
+            ui.label(
+                "房间号已隐藏，好友只能通过搜索完整房间号找到并加入。"
+                if hidden else "房间已显示在联机页，好友也可以直接点击加入。"
+            ).classes("aml-sub text-center")
+            ui.label(
+                f"版本 {detail.get('version') or '未知'} · 上限 {detail.get('max_players') or 8} 人"
+                f" · 本地端口 {detail.get('local_port') or '?'}"
+            ).classes("aml-sub")
+            ui.label(f"已加入玩家：{len(guests)} 人").classes("aml-sub")
+            self.relay_tunnel_label = ui.label(
+                "隧道已连接"
+                if (self.service.relay_status().get("tunnel") or {}).get("running")
+                else "隧道未运行"
+            ).classes("aml-sub")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button(
+                    "复制房间号", on_click=lambda: self._copy(code, "房间号已复制")
+                ).props("unelevated dense no-caps color=primary")
+                ui.button("完成", on_click=dialog.close).props("flat dense no-caps")
+        dialog.open()
+
+    async def _relay_close_room_dialog(self, dialog) -> None:
+        dialog.close()
+        await self._relay_close_room()
+
+    @_relay_ui_task
+    async def _relay_start_create(self) -> None:
+        if not self.service.relay_master():
+            ui.notify("当前版本未内置联机服务，请更新启动器", type="warning")
+            return
+        ui.notify("正在扫描已启动的 Minecraft 端口…")
+        try:
+            info = await run.io_bound(self.service.relay_scan_ports)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"扫描端口失败：{exc}", type="negative")
+            return
+        ports = [item for item in (info.get("ports") or []) if item.get("minecraft")]
+        if not ports:
+            self._relay_need_game_dialog()
+            return
+        version = str(info.get("version") or self.service.config.last_version or "")
+        self._relay_create_ports = ports
+        self._relay_create_version = version
+        self._relay_create_mods = []
+        self._relay_create_mods_found = 0
+        self._relay_create_mods_missing = 0
+        if version:
+            try:
+                self._relay_create_mods = await run.io_bound(
+                    self.service.relay_local_mods, version
+                )
+            except Exception:  # noqa: BLE001
+                self._relay_create_mods = []
+        self._select_view("relay-create")
+
+    def _relay_need_game_dialog(self) -> None:
+        with ui.dialog() as dialog, ui.card().classes("w-[440px] gap-3"):
+            ui.label("请先启动游戏并开放局域网").classes("text-[16px] font-semibold")
+            ui.label(
+                "未检测到可用的 Minecraft 监听端口。请启动游戏，按 ESC 打开菜单，"
+                "点击「对局域网开放」，再回来创建房间。"
+            ).classes("aml-sub")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=dialog.close).props("flat dense no-caps")
+                ui.button(
+                    "重新检测",
+                    on_click=lambda: (dialog.close(), background_tasks.create(
+                        self._relay_start_create()
+                    )),
+                ).props("unelevated dense no-caps color=primary")
+        dialog.open()
+
+    def _render_relay_create_page(self) -> None:
+        if self.relay_create_body is None:
+            return
+        self.relay_create_body.clear()
+        with self.relay_create_body:
+            if not self._relay_create_ports:
+                with ui.card().classes("aml-card w-full p-6 gap-2"):
+                    ui.label("尚未扫描到 Minecraft 端口").classes("text-[15px] font-semibold")
+                    ui.label(
+                        "请先在游戏内「对局域网开放」，然后重新扫描。"
+                    ).classes("aml-sub")
+                    ui.button(
+                        "重新扫描",
+                        on_click=lambda: background_tasks.create(self._relay_start_create()),
+                    ).props("unelevated dense no-caps color=primary")
+                return
+
+            version = self._relay_create_version or self.service.config.last_version or "unknown"
+            with ui.card().classes("aml-card w-full p-5 gap-3"):
+                ui.label("房间信息").classes("text-[15px] font-semibold")
+                with ui.row().classes("w-full gap-3 no-wrap"):
+                    self.relay_create_name = ui.input(
+                        "房间名称", value="我的世界联机"
+                    ).props("dense outlined").classes("flex-1")
+                    self.relay_create_provider = ui.select(
+                        {
+                            "aml": "AMLauncher 官方",
+                            "chmlfrp": "ChmlFRP（暂不可用）",
+                            "loliafrp": "LoliaFRP（暂不可用）",
+                        },
+                        value="aml",
+                        label="联机服务商",
+                    ).props("dense outlined").classes("w-[240px]")
+                with ui.row().classes("w-full items-end gap-3 no-wrap"):
+                    self.relay_create_port = ui.select(
+                        {
+                            int(item["port"]): f"127.0.0.1:{item['port']} · Minecraft"
+                            for item in self._relay_create_ports
+                        },
+                        value=int(self._relay_create_ports[0]["port"]),
+                        label="游戏监听端口",
+                    ).props("dense outlined").classes("flex-1")
+                    ui.button(
+                        icon="refresh",
+                        on_click=lambda: background_tasks.create(self._relay_rescan_create_ports()),
+                    ).props("flat dense round size=sm").tooltip("重新扫描端口")
+                ui.label(
+                    f"当前客户端：{version} · 已检测端口 {len(self._relay_create_ports)} 个"
+                ).classes("aml-sub")
+
+                with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                    self.relay_create_players = ui.slider(
+                        min=2, max=16, value=8, step=1
+                    ).props("label").classes("flex-1")
+                    self.relay_create_players_label = ui.label("上限 8 人").classes(
+                        "aml-sub w-[68px] text-right"
+                    )
+                    self.relay_create_players.on_value_change(
+                        lambda e: setattr(
+                            self.relay_create_players_label, "text", f"上限 {e.value} 人"
+                        )
+                    )
+                self.relay_create_hidden = ui.switch(
+                    "隐藏房间（仅可通过完整房间号搜索加入）"
+                ).props("dense")
+
+            with ui.card().classes("aml-card w-full p-5 gap-2"):
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    ui.label("模组清单").classes("text-[15px] font-semibold")
+                    ui.button(
+                        "检查 Modrinth 链接",
+                        on_click=lambda: background_tasks.create(self._relay_resolve_create_mods()),
+                    ).props("flat dense no-caps")
+                self.relay_create_mods_label = ui.label(
+                    self._relay_create_mods_text()
+                ).classes("aml-sub")
+                with ui.element("div").classes(
+                    "aml-dropzone w-full items-center justify-center gap-1"
+                ).props("data-aml-drop=aml-relay-mods data-aml-click=1"):
+                    ui.icon("upload_file").classes("text-[24px]")
+                    ui.label("点击或拖入模组清单（.json / .txt）").classes("aml-sub")
+                ui.upload(
+                    on_upload=self._relay_upload_mods,
+                    auto_upload=True,
+                    multiple=False,
+                ).props("id=aml-relay-mods accept=.json,.txt").classes("hidden")
+                if self._relay_create_mods:
+                    names = "、".join(
+                        str(item.get("filename") or item.get("name") or "")
+                        for item in self._relay_create_mods[:6]
+                    )
+                    if len(self._relay_create_mods) > 6:
+                        names += f" 等 {len(self._relay_create_mods)} 个"
+                    ui.label(names).classes("aml-sub truncate")
+                if self._relay_create_mods_missing:
+                    ui.label(
+                        f"有 {self._relay_create_mods_missing} 个 Mod 未查到 Modrinth/CurseForge 链接。"
+                        "成员未安装或禁用这些 Mod 时可能无法正常进入，请提示成员自行安装或接受风险。"
+                    ).classes("text-[12px]").style("color: #d97706")
+                ui.label(
+                    "未上传清单时，成员加入将跳过模组校验；上传后会自动比对并提示缺失项。"
+                ).classes("aml-sub")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button(
+                    "取消", on_click=lambda: self._select_view("multiplayer")
+                ).props("flat dense no-caps")
+                self.relay_create_primary = ui.button(
+                    "创建房间",
+                    on_click=lambda: background_tasks.create(self._relay_submit_create()),
+                ).props("unelevated dense no-caps color=primary")
+                self.relay_create_primary.set_enabled(bool(self._relay_create_ports))
+
+    @_relay_ui_task
+    async def _relay_rescan_create_ports(self) -> None:
+        try:
+            info = await run.io_bound(self.service.relay_scan_ports)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"扫描端口失败：{exc}", type="negative")
+            return
+        ports = [item for item in (info.get("ports") or []) if item.get("minecraft")]
+        if not ports:
+            ui.notify("仍未检测到 Minecraft 端口，请先在游戏内对局域网开放", type="warning")
+            return
+        self._relay_create_ports = ports
+        if info.get("version"):
+            self._relay_create_version = str(info["version"])
+        self._render_relay_create_page()
+        ui.notify(f"已检测到 {len(ports)} 个 Minecraft 端口", type="positive")
+
+    def _relay_create_mods_text(self) -> str:
+        count = len(self._relay_create_mods)
+        text = f"已读取 {count} 个已启用的 Mod"
+        if self._relay_create_mods_found:
+            text += f"，其中 {self._relay_create_mods_found} 个已找到链接"
+        if self._relay_create_mods_missing:
+            text += f"，{self._relay_create_mods_missing} 个没有链接"
+        return text
+
+    @_relay_ui_task
+    async def _relay_upload_mods(self, event) -> None:
+        try:
+            raw = await event.file.read()
+            text = raw.decode("utf-8-sig", errors="replace")
+            mods = self._relay_parse_mod_list(text, event.file.filename or "")
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"读取模组清单失败：{exc}", type="negative")
+            return
+        if not mods:
+            ui.notify("清单中没有可识别的 Mod", type="warning")
+            return
+        self._relay_create_mods = mods
+        self._relay_create_mods_found = 0
+        self._relay_create_mods_missing = 0
+        if self.relay_create_mods_label is not None:
+            self.relay_create_mods_label.text = self._relay_create_mods_text()
+        ui.notify(f"已导入 {len(mods)} 个 Mod", type="positive")
+        self._render_relay_create_page()
+
+    @staticmethod
+    def _relay_parse_mod_list(text: str, filename: str) -> list[dict]:
+        text = str(text or "").strip()
+        if not text:
+            return []
+        if filename.lower().endswith(".json") or text.startswith("[") or text.startswith("{"):
+            import json
+
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                payload = payload.get("mods") or payload.get("files") or []
+            if not isinstance(payload, list):
+                return []
+            result = []
+            for item in payload[:300]:
+                if isinstance(item, str):
+                    result.append({"filename": item, "name": item, "enabled": True})
+                elif isinstance(item, dict):
+                    entry = {
+                        key: item.get(key)
+                        for key in (
+                            "filename",
+                            "name",
+                            "version",
+                            "sha1",
+                            "modrinth_url",
+                            "curseforge_url",
+                            "download_url",
+                        )
+                        if item.get(key)
+                    }
+                    entry.setdefault("enabled", bool(item.get("enabled", True)))
+                    if entry.get("filename") or entry.get("name"):
+                        result.append(entry)
+            return result
+        result = []
+        for line in text.splitlines():
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            result.append({"filename": name, "name": name, "enabled": True})
+        return result[:300]
+
+    @_relay_ui_task
+    async def _relay_resolve_create_mods(self) -> None:
+        if not self._relay_create_mods:
+            ui.notify("请先读取或上传模组清单", type="warning")
+            return
+        if self.relay_create_mods_label is not None:
+            self.relay_create_mods_label.text = "正在查询 Modrinth 链接…"
+        try:
+            result = await run.io_bound(
+                self.service.relay_resolve_mods, self._relay_create_mods
+            )
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"查询链接失败：{exc}", type="negative")
+            return
+        self._relay_create_mods = result.get("mods") or self._relay_create_mods
+        self._relay_create_mods_found = int(result.get("found") or 0)
+        self._relay_create_mods_missing = int(result.get("missing") or 0)
+        self._render_relay_create_page()
+        ui.notify(
+            f"已找到 {self._relay_create_mods_found} 个链接，"
+            f"{self._relay_create_mods_missing} 个未找到",
+            type="positive" if not self._relay_create_mods_missing else "warning",
+        )
+
+    @_relay_ui_task
+    async def _relay_submit_create(self) -> None:
+        provider = str(self.relay_create_provider.value or "")
+        if provider != "aml":
+            ui.notify("ChmlFRP / LoliaFRP 暂不可用，请选择 AMLauncher 官方", type="warning")
+            return
+        port = int(self.relay_create_port.value or 0)
+        if not port:
+            ui.notify("请选择游戏监听端口", type="warning")
+            return
+        name = str(self.relay_create_name.value or "").strip() or "我的世界联机"
+        players = int(self.relay_create_players.value or 8)
+        hidden = bool(self.relay_create_hidden.value)
+        mods = list(self._relay_create_mods)
+        if mods and self._relay_create_mods_missing:
+            with ui.dialog() as dialog, ui.card().classes("w-[440px] gap-3"):
+                ui.label("部分 Mod 没有链接").classes("text-[16px] font-semibold")
+                ui.label(
+                    f"有 {self._relay_create_mods_missing} 个 Mod 无法提供下载链接，"
+                    "成员未安装时可能无法进入。是否仍然创建？"
+                ).classes("aml-sub")
+                with ui.row().classes("w-full justify-end gap-2"):
+                    ui.button("取消", on_click=dialog.close).props("flat dense no-caps")
+
+                    async def confirm() -> None:
+                        dialog.close()
+                        await self._relay_create_now(
+                            name, port, players, hidden, mods
+                        )
+
+                    ui.button("仍然创建", on_click=confirm).props(
+                        "unelevated dense no-caps color=warning"
+                    )
+            dialog.open()
+            return
+        await self._relay_create_now(name, port, players, hidden, mods)
+
+    @_relay_ui_task
+    async def _relay_create_now(
+        self, name: str, port: int, players: int, hidden: bool, mods: list[dict]
+    ) -> None:
+        version = self._relay_create_version or "unknown"
+        ui.notify("正在创建房间，首次使用会下载 frpc…")
+        try:
+            room = await run.io_bound(
+                lambda: self.service.relay_create_room(
+                    name=name,
+                    version=version,
+                    loader=self.service.config.mod_loader,
+                    max_players=players,
+                    local_port=port,
+                    provider="aml",
+                    hidden=hidden,
+                    mods=mods,
+                    mods_declared=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"创建房间失败：{exc}", type="negative")
+            return
+        self._start_heartbeat()
+        self._select_view("multiplayer")
+        await self._relay_refresh_rooms()
+        self._relay_show_code(room, hidden)
+
+    def _relay_show_code(self, room: dict, hidden: bool) -> None:
+        code = str(room.get("join_code") or "")
+        # 创建页会切回联机页，弹窗必须挂在联机页插槽上才会显示。
+        with self.pages["multiplayer"]:
+            with ui.dialog() as dialog, ui.card().classes("w-[420px] gap-3 items-center"):
+                ui.label("房间已创建").classes("text-[16px] font-semibold")
+                ui.label(code).classes("text-[40px] font-semibold").style(
+                    "font-family: Consolas, monospace; letter-spacing: .16em"
+                )
+                ui.label(
+                    "房间已隐藏，好友需搜索完整房间号加入。"
+                    if hidden else "把房间号发给好友，或让好友在联机页直接点击加入。"
+                ).classes("aml-sub text-center")
+                with ui.row().classes("justify-center gap-2"):
+                    ui.button(
+                        "复制房间号", on_click=lambda: self._copy(code, "房间号已复制")
+                    ).props("unelevated dense no-caps color=primary")
+                    ui.button("完成", on_click=dialog.close).props("flat dense no-caps")
+        dialog.open()
+
+    def _start_heartbeat(self) -> None:
+        if self.relay_heartbeat_timer is None:
+            self.relay_heartbeat_timer = ui.timer(15.0, self._relay_heartbeat)
+        self.relay_heartbeat_timer.active = True
+
+    async def _relay_heartbeat(self) -> None:
+        room = self.service.relay_status().get("room")
+        if not room:
+            self.relay_heartbeat_timer.active = False
+            return
+        try:
+            info = await run.io_bound(
+                lambda: self.service.relay_heartbeat(room["api"], room["room_id"])
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.relay_heartbeat_timer.active = False
+            ui.notify(f"房间连接已断开：{exc}", type="negative")
+            return
+        if self.relay_players_label is not None:
+            self.relay_players_label.text = f"在线玩家：{info.get('players') or 1} 人"
+
+    async def _relay_close_room(self) -> None:
+        await run.io_bound(self.service.relay_close_room)
+        if self.relay_heartbeat_timer is not None:
+            self.relay_heartbeat_timer.active = False
+        self._render_relay_body(notify="房间已关闭")
+
+    async def _relay_leave_room(self) -> None:
+        await run.io_bound(self.service.relay_leave_room)
+        self._render_relay_body(notify="已退出房间")
+
+    def _copy(self, text: str, message: str) -> None:
+        if not text:
+            return
+        ui.clipboard.write(text)
+        ui.notify(message, type="positive")
 
 
 def setup_pages(service: LauncherService, *, debug: bool = False) -> None:

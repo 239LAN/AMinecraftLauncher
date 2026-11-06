@@ -11,6 +11,8 @@
   必须显式收集，否则打包后会缺文件或报 ImportError。
 """
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
@@ -51,6 +53,14 @@ datas += [
     ("README.md", "."),
     ("LICENSE", "."),
 ]
+
+# 内置 frpc：联机时直接复制使用，不再联网下载
+if Path("frpc.exe").is_file():
+    datas.append(("frpc.exe", "."))
+
+# 主节点地址：该文件不入库，只在打包时写进 exe
+if Path("relay_endpoint.txt").is_file():
+    datas.append(("relay_endpoint.txt", "."))
 
 analysis = Analysis(
     ["main.py"],

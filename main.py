@@ -105,7 +105,16 @@ def main(argv: list[str] | None = None) -> int:
         # 否则无边框窗口最大化会盖住任务栏。
         app.native.start_args["func"] = native_maximize_guard
 
-    ui.run(**run_kwargs)
+    try:
+        ui.run(**run_kwargs)
+    except Exception as exc:  # noqa: BLE001 - 关闭窗口时的 WebSocket 竞态不影响退出
+        # 关闭窗口/退出时前端连接可能已经断开，NiceGUI 仍会尝试发送关闭帧，
+        # websockets 会抛 CloseConnection ... ConnectionState.CLOSED。这里吞掉，
+        # 否则 pywebview 会弹出「Unhandled exception in script」。
+        message = str(exc)
+        if "CloseConnection" not in message and "ConnectionState.CLOSED" not in message:
+            raise
+        service.log(f"关闭时忽略的 WebSocket 异常：{message}")
     return 0
 
 
