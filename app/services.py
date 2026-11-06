@@ -2423,6 +2423,10 @@ class LauncherService:
         info["frozen"] = bool(getattr(sys, "frozen", False))
         return info
 
+    def launcher_changelog(self, limit: int = 8) -> list[dict]:
+        """主页更新日志：直接展示 GitHub Release 的描述。"""
+        return updater.fetch_releases(limit=limit)
+
     def _update_target(self) -> Path:
         if getattr(sys, "frozen", False):
             return updater.update_target()

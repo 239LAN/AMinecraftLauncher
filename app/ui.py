@@ -46,11 +46,11 @@ NAV_ITEMS = [
     ("settings", "settings", "设置"),
 ]
 
-# 更新日志：从新到旧，主页默认展开最新一条，其余折叠。
-FOOTER_CURRENT = "> 最低系统要求： Windows 10(22H2)及以上。"
-FOOTER_LEGACY = "> 暂仅支持离线登录；最低系统要求： Windows 10(22H2)及以上。"
+# 更新日志：主页从 GitHub Releases 读取；下面只保留最新一版作为离线兜底。
+CHANGELOG_LIMIT = 8
+CHANGELOG_FOOTER = "> 最低系统要求： Windows 10(22H2)及以上。"
 
-CHANGELOG = [
+CHANGELOG_FALLBACK = [
     {
         "version": "1.5.0",
         "title": "联机",
@@ -78,215 +78,6 @@ CHANGELOG = [
 ### 修复
 - 无
 """,
-    },
-    {
-        "version": "1.4.2",
-        "title": "头像与界面精简",
-        "notes": """\
-### 新增
-- 正版账号头像改为从皮肤 API 获取；未登录与离线账号显示史蒂夫头像
-
-### 优化
-- 移除启动页与登录弹窗中的多余提示文字
-
-### 修复
-- 无
-""",
-    },
-    {
-        "version": "1.4.1",
-        "title": "登录切换 · 日志整理",
-        "notes": """\
-### 新增
-- 启动页可在正版登录与离线登录之间切换
-- 正版登录自动复制设备码，并在 1 秒后打开浏览器
-- 正版账号与离线账号独立保存，切换登录方式即可快速切换账号
-- 启动页默认沿用上次的登录方式，首次使用默认正版登录
-
-### 优化
-- 正版登录排在离线登录前，登录按钮不再显示图标
-- 更新日志改为只描述功能变化，不再罗列操作与实现细节
-
-### 修复
-- 无
-
-"""
-        + FOOTER_CURRENT,
-    },
-    {
-        "version": "1.4.0",
-        "title": "内容管理 · 自动更新",
-        "notes": """\
-### 新增
-- 新增资源包与光影包管理
-- 新增存档截图管理
-- 新增启动器自动更新
-- 新增运行日志查看
-- 新增微软正版登录
-- 下载 Mod 后自动提示缺少的前置依赖，可一键安装
-
-### 优化
-- 移除标题栏图标，设置中不再需要填写客户端 ID
-
-### 修复
-- 无
-
-"""
-        + FOOTER_CURRENT,
-    },
-    {
-        "version": "1.3.1",
-        "title": "图标重绘",
-        "notes": """\
-### 新增
-- 无
-
-### 优化
-- 重绘应用图标，标题栏与程序图标保持一致
-
-### 修复
-- 修复任务栏图标显示模糊
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.3.0",
-        "title": "加载器 · Mod 管理 · 存档服务器",
-        "notes": """\
-### 新增
-- 安装游戏时可选 Fabric / Forge / NeoForge / Quilt 加载器
-- 安装游戏与导入整合包时可自定义版本名称，版本支持重命名
-- Mod 列表显示模组名称、版本与图标
-- 支持启用 / 禁用 Mod
-- 进入 Mod 管理时自动检查更新，可一键更新
-- 新增存档管理与服务器管理
-
-### 优化
-- 无
-
-### 修复
-- 无
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.2.1",
-        "title": "窗口修复",
-        "notes": """\
-### 新增
-- 无
-
-### 优化
-- 无
-
-### 修复
-- 修复窗口最大化后遮挡任务栏
-- 修复多显示器下最大化与还原位置不正确
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.2.0",
-        "title": "全量修复 · 体验优化",
-        "notes": """\
-### 新增
-- 无
-
-### 优化
-- 下载支持断点续传、分片并发与双源加速
-- 重做整合包安装，自动补全游戏与加载器
-- 整合包 Mod 支持并发下载
-- 导入 Mod 与整合包时保留原文件名
-- 安装任务改为排队执行，可随时取消
-
-### 修复
-- 修复关闭按钮无响应
-- 修复下载进度可能超过 100%
-- 修复 Forge / NeoForge 版本识别错误
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.1.1",
-        "title": "存储修复 · 压缩",
-        "notes": """\
-### 新增
-- 无
-
-### 优化
-- 哈希存储支持压缩，减少磁盘占用
-- 启动器异常退出后自动回收残留文件
-- 避免重复启动与误切换游戏目录
-
-### 修复
-- 修复浏览器模式关闭页面时清空游戏目录
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.1.0",
-        "title": "哈希存储 · 去重启动",
-        "notes": """\
-### 新增
-- 新增哈希存储（实验性），相同文件只保存一份
-- 支持开启 / 关闭存储方式并自动迁移
-
-### 优化
-- 已存在的文件不再重复下载
-
-### 修复
-- 修复若干界面与存储问题
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.0.1",
-        "title": "界面重构 · CurseForge 镜像",
-        "notes": """\
-### 新增
-- 新增哈希存储（实验性）
-- CurseForge 下载无需配置 API Key
-
-### 优化
-- 界面改为简洁浅色风格
-- 主页新增更新日志
-- 导入 Mod 与整合包改为拖放
-- 启动进度改为页面内展示，可取消
-- 启动器退出前自动结束游戏并保存存档
-
-### 修复
-- 修复部分 CDN 下载失败
-
-"""
-        + FOOTER_LEGACY,
-    },
-    {
-        "version": "1.0.0",
-        "title": "首个正式版本",
-        "notes": """\
-### 新增
-- 离线登录、一键启动，启动过程实时展示进度
-- 版本安装、补全缺失文件、版本隔离、删除与崩溃日志诊断
-- Mod / 资源包 / 光影包 / 整合包下载，支持本地整合包导入
-- 自动检测本机 Java，缺失时自动下载安装
-- 多线程并发 + 大文件分片 + 断点续传，镜像失败自动回退官方源
-- 任务中心统一展示进度、速度与已完成大小
-- 应用图标、版本信息与单文件便携版
-
-### 优化
-- 无
-
-### 修复
-- 无
-
-"""
-        + FOOTER_LEGACY,
     },
 ]
 
@@ -1312,15 +1103,9 @@ class LauncherUI:
                         ui.label(f"当前 v{APP_VERSION}").classes("aml-chip primary")
                     with ui.column().classes(
                         "w-full flex-1 min-h-0 px-6 pb-3 gap-0 no-wrap aml-scroll"
-                    ):
-                        for index, entry in enumerate(CHANGELOG):
-                            with ui.expansion(
-                                f"v{entry['version']}",
-                                group="aml-changelog",
-                                value=index == 0,
-                            ).classes("aml-logitem w-full"):
-                                ui.label(entry["title"]).classes("aml-log-title")
-                                ui.markdown(entry["notes"]).classes("aml-log-body")
+                    ) as changelog_box:
+                        self.home_changelog = changelog_box
+                        ui.label("正在获取更新日志…").classes("aml-sub py-2")
                     with ui.row().classes(
                         "w-full items-center gap-2 no-wrap px-6 py-3 shrink-0"
                     ).style("border-top: 1px solid var(--aml-border)"):
@@ -1350,6 +1135,57 @@ class LauncherUI:
                 auto_upload=True,
                 multiple=True,
             ).props("id=aml-home-upload").classes("hidden")
+
+        background_tasks.create(self._load_changelog())
+
+    # ---- 更新日志（GitHub Releases） ----
+    async def _load_changelog(self) -> None:
+        try:
+            entries = await run.io_bound(
+                self.service.launcher_changelog, CHANGELOG_LIMIT
+            )
+        except Exception as exc:  # noqa: BLE001 - 网络失败时退回内置文案
+            self._render_changelog(error=str(exc) or "网络不可用")
+            return
+        self._render_changelog(entries=entries)
+
+    def _render_changelog(
+        self, entries: Optional[list[dict]] = None, error: str = ""
+    ) -> None:
+        box = getattr(self, "home_changelog", None)
+        if box is None:
+            return
+        box.clear()
+        with box:
+            if not entries:
+                if error:
+                    ui.label(f"更新日志获取失败：{error}").classes("aml-sub py-1")
+                    ui.button("重新获取", on_click=self._reload_changelog).props(
+                        "flat dense no-caps"
+                    ).classes("text-[12px] justify-start")
+                    ui.label("以下为内置的最近一版说明").classes("aml-sub py-1")
+                entries = CHANGELOG_FALLBACK
+            for index, entry in enumerate(entries):
+                with ui.expansion(
+                    f"v{entry['version']}",
+                    group="aml-changelog",
+                    value=index == 0,
+                ).classes("aml-logitem w-full"):
+                    if entry.get("title"):
+                        ui.label(entry["title"]).classes("aml-log-title")
+                    ui.markdown(entry.get("notes") or "本次更新未填写说明。").classes(
+                        "aml-log-body"
+                    )
+            ui.markdown(CHANGELOG_FOOTER).classes("aml-log-body")
+
+    async def _reload_changelog(self) -> None:
+        box = getattr(self, "home_changelog", None)
+        if box is None:
+            return
+        box.clear()
+        with box:
+            ui.label("正在获取更新日志…").classes("aml-sub py-2")
+        await self._load_changelog()
 
     def _refresh_home(self) -> None:
         self._render_home_identity()

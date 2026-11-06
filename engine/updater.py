@@ -75,6 +75,50 @@ def fetch_latest(*, timeout: int = 15) -> dict:
     }
 
 
+def fetch_releases(limit: int = 8, *, timeout: int = 10) -> list[dict]:
+    """读取最近的 Release 列表，供主页更新日志展示。"""
+    count = max(1, min(int(limit), 20))
+    status, payload = net.get_json_auth(
+        f"https://api.github.com/repos/{REPOSITORY}/releases?per_page={count}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{REPOSITORY}/changelog",
+        },
+        timeout=timeout,
+    )
+    if status != 200 or not isinstance(payload, list):
+        detail = payload.get("message") if isinstance(payload, dict) else payload
+        raise UpdateError(f"获取更新日志失败：{detail or status}")
+
+    entries = []
+    for item in payload:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        version = str(item.get("tag_name") or "").strip().lstrip("vV")
+        if not version:
+            continue
+        name = str(item.get("name") or "").strip()
+        entries.append(
+            {
+                "version": version,
+                "title": "" if name.lower() in (f"v{version}".lower(), version.lower()) else name,
+                "notes": _strip_title(str(item.get("body") or "")),
+                "url": str(item.get("html_url") or ""),
+                "published_at": str(item.get("published_at") or ""),
+            }
+        )
+    return entries
+
+
+def _strip_title(body: str) -> str:
+    """去掉描述开头重复的标题行，如 ``## A Minecraft Launcher v1.4.2``。"""
+    text = body.strip()
+    lines = text.splitlines()
+    if lines and lines[0].startswith("#") and "launcher" in lines[0].lower():
+        return "\n".join(lines[1:]).strip()
+    return text
+
+
 def _pick_asset(assets: list) -> Optional[dict]:
     executables = [
         item
