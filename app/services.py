@@ -81,6 +81,8 @@ class LauncherService:
         # 不同版本的安装会同时写同一批 libraries / assets，串行化避免写坏共享文件。
         self._files_lock = threading.Lock()
         self._game_lock = threading.RLock()
+        # 启动流程互斥：双击或两个页面同时点启动时只允许一个真正拉起游戏。
+        self._launch_lock = threading.Lock()
         self._game_process: Optional[subprocess.Popen] = None
         self._game_version = ""
         self._game_run_dir: Optional[Path] = None
@@ -226,6 +228,7 @@ class LauncherService:
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=10,
                 )
             else:
                 process.terminate()
@@ -1028,6 +1031,41 @@ class LauncherService:
         cancel: Optional[Callable[[], bool]] = None,
         extra_game: Optional[list[str]] = None,
     ) -> dict:
+        """启动游戏；同一时间只允许一个启动流程，避免拉起多个实例。"""
+        if not self._launch_lock.acquire(blocking=False):
+            raise RuntimeError("游戏正在启动中，请稍候")
+        try:
+            return self._launch_locked(
+                version,
+                offline=offline,
+                username=username,
+                account_id=account_id,
+                memory_mb=memory_mb,
+                width=width,
+                height=height,
+                dry_run=dry_run,
+                progress=progress,
+                cancel=cancel,
+                extra_game=extra_game,
+            )
+        finally:
+            self._launch_lock.release()
+
+    def _launch_locked(
+        self,
+        version: str,
+        *,
+        offline: bool = True,
+        username: str = "Steve",
+        account_id: Optional[str] = None,
+        memory_mb: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        dry_run: bool = False,
+        progress: Optional[Callable[[dict], None]] = None,
+        cancel: Optional[Callable[[], bool]] = None,
+        extra_game: Optional[list[str]] = None,
+    ) -> dict:
         """构建命令行并拉起 Java；只触发 Popen，不阻塞调用方。
 
         ``progress`` 用于上报启动阶段（含 Java 自动安装进度），
@@ -1136,24 +1174,59 @@ class LauncherService:
             }
 
         game_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._game_log_path(version)
         popen_kwargs: dict = {}
         if os.name == "nt":
             # 避免 java.exe 在桌面上弹出黑色控制台窗口。
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
-            process = subprocess.Popen(command, cwd=str(game_dir), **popen_kwargs)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8", errors="replace") as handle:
+                handle.write(
+                    f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 启动 {version} =====\n"
+                )
+                handle.flush()
+                # 把游戏输出落到日志，启动失败时界面和日志里都能看到原因。
+                popen_kwargs["stdout"] = handle
+                popen_kwargs["stderr"] = subprocess.STDOUT
+                process = subprocess.Popen(command, cwd=str(game_dir), **popen_kwargs)
         except Exception:
             if run_dir is not None:
                 self.hash_store.clear(run_dir)
             raise
+        self.log(f"游戏输出日志：{log_path}")
         self._register_game(process, version, run_dir)
-        emit(100, f"已启动（PID {process.pid}）")
+        # 有的失败（缺依赖、Java 参数错误）会让进程几秒内就退出，先确认真的起来了。
+        emit(99, "等待游戏窗口…")
+        time.sleep(1.5)
+        code = process.poll()
+        if code is not None:
+            tail = self._tail_text(log_path)
+            detail = f"游戏启动后立即退出（退出码 {code}）"
+            self.log(f"{detail}；最近输出：\n{tail}" if tail else detail)
+            raise RuntimeError(f"{detail}。{tail}" if tail else detail)
+        emit(100, f"游戏已启动（PID {process.pid}）")
         return {
             "pid": process.pid,
             "command": command,
             "account": account.username,
             "game_directory": str(game_dir),
+            "log": str(log_path),
         }
+
+    def _game_log_path(self, version: str) -> Path:
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in version)
+        return self.store.data_dir / "logs" / f"game-{safe}.log"
+
+    @staticmethod
+    def _tail_text(path: Path, *, lines: int = 6, limit: int = 600) -> str:
+        """取日志末尾若干行，用于把崩溃原因直接展示在启动失败提示里。"""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        tail = "\n".join(text.strip().splitlines()[-lines:]) if text.strip() else ""
+        return tail[-limit:]
 
     def _ensure_java(
         self,

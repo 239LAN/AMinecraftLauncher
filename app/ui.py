@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import threading
@@ -906,15 +907,25 @@ class LauncherUI:
         self.open_dialog("结束游戏并退出", builder)
 
     async def _close_with_game(self) -> None:
+        self._force_exit_after()
         self.dialog.close()
         ui.notify("正在结束游戏并同步存档…", position="top-right")
         await run.io_bound(self.service.shutdown_storage)
         self._close_window()
 
     async def _close_after_sync(self) -> None:
+        self._force_exit_after()
         ui.notify("正在同步哈希文件库…", position="top-right")
         await run.io_bound(self.service.shutdown_storage)
         self._close_window()
+
+    def _force_exit_after(self, seconds: float = 20.0) -> None:
+        """关闭流程卡住时兜底强退，避免「点了关闭却关不掉」。"""
+        def killer() -> None:
+            time.sleep(seconds)
+            os._exit(0)
+
+        threading.Thread(target=killer, daemon=True).start()
 
     def _build_pages(self) -> None:
         with ui.element("div").classes("w-full flex-1 min-h-0"):
@@ -1455,6 +1466,14 @@ class LauncherUI:
         version = self.home_version.value
         if not version:
             ui.notify("请先在下载页安装游戏版本", type="warning", position="top-right")
+            return
+        if self.service.has_running_game():
+            info = self.service.running_game_info()
+            ui.notify(
+                f"游戏正在运行（{info.get('version') or '未知版本'}），请先关闭游戏窗口",
+                type="warning",
+                position="top-right",
+            )
             return
         self._start_home_launch()
         await self._launch(
@@ -4578,6 +4597,12 @@ class LauncherUI:
             with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px] items-center justify-center"):
                 ui.icon("cloud_off").classes("text-[26px]").style("color: var(--aml-muted)")
                 ui.label(self._relay_rooms_error).classes("aml-sub text-center")
+                ui.button(
+                    "重试",
+                    on_click=lambda: background_tasks.create(
+                        self._refresh_relay_rooms(force=True)
+                    ),
+                ).props("flat dense no-caps")
             return
         if not self._relay_rooms:
             with ui.card().classes("aml-card p-4 gap-2 w-[240px] min-h-[132px] items-center justify-center"):

@@ -86,7 +86,7 @@ def fetch_nodes(master: str, *, timeout: int = 8) -> list[dict]:
     master = _base(master)
     if not master:
         raise RelayError("未配置联机主节点地址")
-    status, payload = net.request_json(
+    status, payload = _request(
         f"{master}/api/v1/nodes",
         method="GET",
         timeout=timeout,
@@ -95,6 +95,23 @@ def fetch_nodes(master: str, *, timeout: int = 8) -> list[dict]:
     if status != 200 or not isinstance(payload.get("nodes"), list):
         raise RelayError(_error_message(payload, "获取联机节点失败"), code=str(status))
     return [item for item in payload["nodes"] if item.get("api")]
+
+
+def _request(
+    url: str,
+    *,
+    method: str = "GET",
+    json_body: Optional[dict] = None,
+    headers: Optional[dict[str, str]] = None,
+    timeout: int = 15,
+) -> tuple[int, dict]:
+    """发起请求并把网络层异常统一成 RelayError，界面无需展示底层报错。"""
+    try:
+        return net.request_json(
+            url, method=method, json_body=json_body, headers=headers, timeout=timeout
+        )
+    except (OSError, ValueError) as exc:
+        raise RelayError("联机服务暂时不可用，请稍后重试", code="NETWORK") from exc
 
 
 def _error_message(payload: dict, fallback: str) -> str:
@@ -118,7 +135,7 @@ class RelayClient:
         headers = signed_headers(method, path)
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        status, payload = net.request_json(
+        status, payload = _request(
             f"{self.api}{path}",
             method=method,
             json_body=body,

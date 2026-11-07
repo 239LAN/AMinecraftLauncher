@@ -35,9 +35,12 @@ def main() -> int:
     print(f"构建 {APP_VERSION} -> {dist}")
     code = subprocess.call(command, cwd=ROOT)
     if code == 0:
-        # 清理其它版本目录。
+        # 清理其它版本目录；带 data/ 的目录保留，避免误删存档、账号与配置。
         for child in (ROOT / "dist").iterdir():
             if child.is_dir() and child.name != APP_VERSION:
+                if (child / "data").exists():
+                    print(f"保留 {child.name}/data（运行数据不删除）")
+                    continue
                 shutil.rmtree(child, ignore_errors=True)
     return code
 

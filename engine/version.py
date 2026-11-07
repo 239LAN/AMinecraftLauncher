@@ -1,7 +1,7 @@
 """应用名称与版本号（引擎层与界面层共用，避免多处硬编码）。"""
 
 APP_NAME = "A Minecraft Launcher"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 
 def user_agent() -> str:

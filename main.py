@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import multiprocessing
+import os
 import socket
 import sys
 from pathlib import Path
@@ -36,6 +37,38 @@ def _webview_available() -> bool:
         return True
     except Exception:  # noqa: BLE001 - 缺少 GUI 依赖时降级
         return False
+
+
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def _ensure_single_instance() -> bool:
+    """Windows 下只允许运行一个启动器；已有实例时把旧窗口提到前台。"""
+    global _SINGLE_INSTANCE_HANDLE
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, False, "AMinecraftLauncher.SingleInstance")
+        if not handle:
+            return True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            user32 = ctypes.windll.user32
+            window = user32.FindWindowW(None, APP_NAME)
+            if window:
+                user32.ShowWindow(window, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(window)
+            else:
+                user32.MessageBoxW(None, "启动器已经在运行。", APP_NAME, 0x40)
+            return False
+        _SINGLE_INSTANCE_HANDLE = handle  # 持有到进程结束，避免互斥量被释放
+        return True
+    except Exception:  # noqa: BLE001 - 单实例失败不应阻止启动
+        return True
 
 
 def build_app(*, debug: bool = False) -> LauncherService:
@@ -66,6 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reload", action="store_true", help="开发模式热重载")
     parser.add_argument("--debug", action="store_true", help="显示运行日志面板")
     args = parser.parse_args(argv)
+
+    # 桌面模式限制单实例，避免两个启动器同时拉起同一个游戏。
+    if not args.web and _webview_available() and not _ensure_single_instance():
+        return 0
 
     service = build_app(debug=args.debug)
     # 关闭窗口 / 系统关机时结束游戏并回收哈希存储的工作目录。
