@@ -25,6 +25,19 @@ from engine.version import APP_NAME, APP_VERSION
 
 from .services import LauncherService
 
+# 启动器更新方式：固定三档，界面与后台检查共用。
+UPDATE_MODES = {
+    "auto": "帮我自动更新",
+    "notify": "提醒我有更新",
+    "off": "不检查更新",
+}
+UPDATE_MODE_HINTS = {
+    "auto": "启动时自动下载并安装更新",
+    "notify": "启动时检查更新，同一版本只提醒一次",
+    "off": "已关闭启动器更新检查",
+}
+
+
 def _relay_ui_task(func):
     """让由 background_tasks 触发的联机异步方法仍能在页面插槽中创建 UI。"""
     @wraps(func)
@@ -3923,13 +3936,22 @@ class LauncherUI:
                 with ui.column().classes("gap-0"):
                     ui.label("启动器更新").classes("text-[14px] font-semibold")
                     ui.label(
-                        f"当前 v{APP_VERSION} · 启动时自动检查，下载优先走公共 GH 代理"
+                        f"当前 v{APP_VERSION} · 下载优先走公共 GH 代理"
                     ).classes("aml-sub")
                 ui.button(
                     "检查更新", icon="system_update_alt",
                     on_click=lambda: background_tasks.create(self._check_update(True)),
                 ).props("flat dense no-caps")
-            self.update_hint = ui.label("启动时会在后台自动检查更新").classes("aml-sub")
+            with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                self.set_update_mode = ui.select(
+                    UPDATE_MODES,
+                    value=view.get("launcher_update_mode") or "notify",
+                    label="更新方式",
+                ).classes("w-56").props("dense outlined")
+                ui.label("同一版本只提醒一次；Release 附件被替换会再次提醒").classes(
+                    "aml-sub"
+                )
+            self.update_hint = ui.label(self._update_mode_text()).classes("aml-sub")
 
         with ui.column().classes("aml-card flat w-full p-4 gap-2"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
@@ -3995,6 +4017,7 @@ class LauncherUI:
             "mod_source": self.set_mod_source.value,
             "mod_loader": self.set_mod_loader.value,
             "include_snapshots": bool(self.set_include_snapshots.value),
+            "launcher_update_mode": str(self.set_update_mode.value or "notify"),
         }
         try:
             view = await run.io_bound(self.service.update_config, changes)
@@ -4004,6 +4027,8 @@ class LauncherUI:
         self.mirror_hint.text = (
             f"当前下载源：{view['mirror'].get('active') or view['mirror'].get('source')}"
         )
+        if hasattr(self, "update_hint"):
+            self.update_hint.text = self._update_mode_text()
         # 下载页有同名快照开关，保持同步，避免显示过期状态。
         if hasattr(self, "snapshot_switch"):
             self.snapshot_switch.value = bool(self.service.config.include_snapshots)
@@ -4011,10 +4036,74 @@ class LauncherUI:
         ui.notify("启动器设置已保存", type="positive", position="top-right")
 
     # ---------------------------------------------------------- 更新与日志
-    def _silent_update_check(self) -> None:
-        background_tasks.create(self._check_update(False))
+    def _update_mode(self) -> str:
+        mode = str(getattr(self.service.config, "launcher_update_mode", "notify") or "notify")
+        return mode if mode in UPDATE_MODES else "notify"
 
-    async def _check_update(self, manual: bool) -> dict:
+    def _update_mode_text(self) -> str:
+        return UPDATE_MODE_HINTS.get(self._update_mode(), "")
+
+    def _silent_update_check(self) -> None:
+        background_tasks.create(self._auto_update_check())
+
+    async def _auto_update_check(self) -> None:
+        """按设置处理启动时的更新：自动安装 / 只提醒一次 / 不检查。"""
+        mode = self._update_mode()
+        if mode == "off":
+            return
+        info = await self._check_update(False, notify=False)
+        if not info or not info.get("available"):
+            return
+        identity = str(info.get("identity") or "")
+        if identity and identity == str(self.service.config.launcher_update_seen or ""):
+            return
+        if mode == "notify":
+            self.service.mark_launcher_update_seen(identity)
+            ui.notify(
+                f"发现新版本 v{info.get('version')}，可在「设置 → 启动器更新」查看",
+                type="info",
+                position="top-right",
+            )
+            return
+        await self._auto_apply_update(info, identity)
+
+    async def _auto_apply_update(self, info: dict, identity: str) -> None:
+        if self.service.has_running_game() or self._home_launching:
+            ui.notify(
+                f"发现新版本 v{info.get('version')}，当前有游戏在运行，稍后再更新",
+                type="info",
+                position="top-right",
+            )
+            return
+        try:
+            result = await run.io_bound(
+                lambda: self.service.download_launcher_update(info)
+            )
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"自动更新下载失败：{exc}", type="negative", position="top-right")
+            return
+        path = str(result.get("path") or "")
+        if not info.get("frozen"):
+            self.service.mark_launcher_update_seen(identity)
+            ui.notify(
+                f"更新已下载到 {path}（源码模式不会替换程序）",
+                type="positive",
+                position="top-right",
+            )
+            return
+        if self.service.has_running_game() or self._home_launching:
+            ui.notify("更新已下载，退出启动器后生效", type="info", position="top-right")
+            return
+        try:
+            await run.io_bound(self.service.apply_launcher_update, path)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(f"自动更新安装失败：{exc}", type="negative", position="top-right")
+            return
+        self.service.mark_launcher_update_seen(identity)
+        ui.notify("正在重启并安装更新…", position="top-right")
+        ui.timer(0.6, app.shutdown, once=True)
+
+    async def _check_update(self, manual: bool, notify: bool = True) -> dict:
         if getattr(self, "_update_checking", False):
             return {}
         self._update_checking = True
@@ -4038,7 +4127,7 @@ class LauncherUI:
                 hint.text = f"发现新版本 v{info['version']}（当前 v{APP_VERSION}）"
             if manual:
                 self._open_update_dialog(info)
-            else:
+            elif notify:
                 ui.notify(
                     f"发现新版本 v{info['version']}，可在「设置 → 启动器更新」查看",
                     type="info",

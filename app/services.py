@@ -40,13 +40,53 @@ from engine.launch_builder import LaunchBuilder
 from engine.loader_installer import SUPPORTED_LOADERS, LoaderError, LoaderInstaller
 from engine.models import Account, FileEntry, GamePaths
 from engine.modpack import ModpackInstaller
-from engine.mod_provider import CURSEFORGE_API, MODRINTH_API, ModProvider, build_provider
+from engine.mod_provider import (
+    CURSEFORGE_API,
+    MODRINTH_API,
+    ModProvider,
+    build_provider,
+    murmur2_fingerprint,
+)
 from engine.version import APP_VERSION
 from engine.version_resolver import VersionResolver
 
 from .config import ConfigStore, LauncherConfig
 from .secrets import SecretStore
 from .tasks import Task, TaskManager, TaskStatus
+
+
+def pick_updated_file(files: list, current_sha1: str, current_published: str = ""):
+    """从候选文件里挑出真正更新的那个。
+
+    只用哈希差异 + 发布时间判断，不比较版本号：不少 Mod 的 jar 内版本号与
+    Modrinth 上的 version_number 并不一致。没有发布时间时退回旧行为。
+    """
+    candidates = [
+        item for item in files if item.sha1 and item.sha1.lower() != current_sha1.lower()
+    ]
+    if not candidates:
+        return None
+    if not current_published:
+        return candidates[0]
+    later = [
+        item for item in candidates if item.published_at and item.published_at > current_published
+    ]
+    return max(later, key=lambda item: item.published_at) if later else None
+
+
+def launcher_update_available(
+    version: str, current: str, identity: str, seen: str
+) -> bool:
+    """判断是否有启动器更新。
+
+    新版本算更新；同一版本 Release 的附件被重新上传（标识变化）也算一次更新。
+    新安装的用户没有历史标识时，不会把自己当前版本误判成更新。
+    """
+    seen_version = seen.split("|", 1)[0] if seen else ""
+    return bool(
+        updater.is_newer(version, current)
+        or (version == current and seen_version == current and identity != seen)
+    )
 
 
 class LauncherService:
@@ -1747,53 +1787,131 @@ class LauncherService:
 
     # ------------------------------------------------------------ Mod 更新
     def check_mod_updates(self, version_id: str) -> dict[str, dict]:
-        """按 SHA1 反查 Modrinth，返回有更新且版本匹配的 Mod。"""
+        """先按 SHA1 查 Modrinth，查不到再按指纹查 CurseForge。"""
         profile = self.version_profile(version_id)
         game_version = profile.get("game_version") or None
         loader = profile.get("loader")
         loader = loader if loader not in (None, "", "vanilla", "optifine") else None
-        provider = build_provider("modrinth", timeout=10)
+        modrinth = build_provider("modrinth", timeout=10)
+        curseforge = build_provider("curseforge", timeout=15)
+
         updates: dict[str, dict] = {}
+        pending: list[tuple[dict, str, int]] = []
         for item in self.content_list(CONTENT_MOD, version_id):
             sha1 = item.get("sha1")
             if not item.get("enabled") or not sha1:
                 continue
+            found = self._modrinth_update(modrinth, sha1, game_version, loader)
+            if found:
+                updates[item["filename"]] = found
+                continue
+            fingerprint = self._jar_fingerprint(str(item.get("path") or ""))
+            if fingerprint:
+                pending.append((item, sha1, fingerprint))
+
+        if pending:
             try:
-                status, payload = net.get_json_auth(
-                    f"{MODRINTH_API}/version_file/{sha1}?algorithm=sha1",
-                    headers={"Accept": "application/json"},
-                    timeout=10,
+                matches = curseforge.fingerprint_lookup([fp for _, _, fp in pending])
+            except Exception:  # noqa: BLE001 - CurseForge 不可用时只保留 Modrinth 结果
+                matches = {}
+            for item, sha1, fingerprint in pending:
+                match = matches.get(fingerprint)
+                if not match:
+                    continue
+                found = self._curseforge_update(
+                    curseforge, match, sha1, game_version, loader
                 )
-            except Exception:  # noqa: BLE001 - 单个 Mod 查询失败不影响其它
-                continue
-            if status != 200 or not isinstance(payload, dict):
-                continue
-            project_id = str(payload.get("project_id") or "")
-            current = str(payload.get("version_number") or "")
-            if not project_id:
-                continue
-            try:
-                files = provider.resolve_files(
-                    project_id, game_version=game_version, loader=loader
-                )
-            except Exception:  # noqa: BLE001
-                continue
-            newer = next(
-                (f for f in files if f.sha1 and f.sha1.lower() != sha1.lower()), None
-            )
-            if newer is None:
-                continue
-            updates[item["filename"]] = {
-                "project_id": project_id,
-                "current_version": current,
-                "new_version": newer.version,
-                "filename": newer.filename,
-                "url": newer.url,
-                "size": newer.size,
-                "sha1": newer.sha1,
-                "game_versions": newer.game_versions,
-            }
+                if found:
+                    updates[item["filename"]] = found
         return updates
+
+    @staticmethod
+    def _jar_fingerprint(path: str) -> int:
+        if not path:
+            return 0
+        try:
+            return murmur2_fingerprint(path)
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _modrinth_update(
+        provider: ModProvider,
+        sha1: str,
+        game_version: str | None,
+        loader: str | None,
+    ) -> dict | None:
+        try:
+            status, payload = net.get_json_auth(
+                f"{MODRINTH_API}/version_file/{sha1}?algorithm=sha1",
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+        except Exception:  # noqa: BLE001 - 单个 Mod 查询失败不影响其它
+            return None
+        if status != 200 or not isinstance(payload, dict):
+            return None
+        project_id = str(payload.get("project_id") or "")
+        if not project_id:
+            return None
+        current = str(payload.get("version_number") or "")
+        # jar 内版本号常与平台版本号不一致，只用发布时间判断新旧。
+        current_published = str(payload.get("date_published") or "")
+        try:
+            files = provider.resolve_files(
+                project_id, game_version=game_version, loader=loader
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        newer = pick_updated_file(files, sha1, current_published)
+        if newer is None:
+            return None
+        return {
+            "project_id": project_id,
+            "current_version": current,
+            "new_version": newer.version,
+            "filename": newer.filename,
+            "url": newer.url,
+            "size": newer.size,
+            "sha1": newer.sha1,
+            "game_versions": newer.game_versions,
+            "source": "modrinth",
+        }
+
+    @staticmethod
+    def _curseforge_update(
+        provider: ModProvider,
+        match: dict,
+        sha1: str,
+        game_version: str | None,
+        loader: str | None,
+    ) -> dict | None:
+        file = match.get("file") or {}
+        project_id = str(file.get("modId") or "")
+        if not project_id:
+            return None
+        current = str(file.get("displayName") or "")
+        current_published = str(file.get("fileDate") or "")
+        try:
+            files = provider.resolve_files(
+                project_id, game_version=game_version, loader=loader
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        newer = pick_updated_file(files, sha1, current_published)
+        if newer is None:
+            return None
+        return {
+            "project_id": project_id,
+            "current_version": current,
+            "new_version": newer.version,
+            "filename": newer.filename,
+            "url": newer.url,
+            "size": newer.size,
+            "sha1": newer.sha1,
+            "game_versions": newer.game_versions,
+            "source": "curseforge",
+        }
 
     def update_mod(
         self,
@@ -2459,6 +2577,7 @@ class LauncherService:
             "isolated",
             "last_account",
             "login_mode",
+            "launcher_update_mode",
         }
         for key, value in changes.items():
             if key in allowed:
@@ -2491,10 +2610,24 @@ class LauncherService:
     # ------------------------------------------------------------------ 自更新
     def check_launcher_update(self) -> dict:
         info = updater.fetch_latest()
+        identity = updater.asset_identity(info)
+        version = str(info.get("version") or "")
+        info["identity"] = identity
         info["current"] = APP_VERSION
-        info["available"] = updater.is_newer(info.get("version") or "", APP_VERSION)
+        info["available"] = launcher_update_available(
+            version,
+            APP_VERSION,
+            identity,
+            str(self.config.launcher_update_seen or ""),
+        )
         info["frozen"] = bool(getattr(sys, "frozen", False))
         return info
+
+    def mark_launcher_update_seen(self, identity: str) -> None:
+        """记录已提醒 / 已安装的更新，保证同一次更新只提醒一次。"""
+        if identity and self.config.launcher_update_seen != identity:
+            self.config.launcher_update_seen = identity
+            self.store.save(self.config)
 
     def launcher_changelog(self, limit: int = 8) -> list[dict]:
         """主页更新日志：直接展示 GitHub Release 的描述。"""

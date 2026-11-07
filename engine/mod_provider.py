@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -52,6 +53,45 @@ LOADER_TO_CF = {
 }
 
 
+def murmur2(data: bytes, seed: int = 1) -> int:
+    """MurmurHash2 32 位实现（CurseForge 指纹使用 seed=1）。"""
+    length = len(data)
+    m = 0x5BD1E995
+    h = (seed ^ length) & 0xFFFFFFFF
+    index = 0
+    remaining = length
+    while remaining >= 4:
+        k = int.from_bytes(data[index : index + 4], "little")
+        k = (k * m) & 0xFFFFFFFF
+        k ^= k >> 24
+        k = (k * m) & 0xFFFFFFFF
+        h = (h * m) & 0xFFFFFFFF
+        h ^= k
+        index += 4
+        remaining -= 4
+    if remaining == 3:
+        h ^= data[index + 2] << 16
+    if remaining >= 2:
+        h ^= data[index + 1] << 8
+    if remaining >= 1:
+        h ^= data[index]
+        h = (h * m) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * m) & 0xFFFFFFFF
+    h ^= h >> 15
+    return h
+
+
+# CurseForge 指纹会先剔除制表符、换行、回车与空格，再对剩余字节做 Murmur2。
+CF_STRIPPED_BYTES = b"\t\n\r "
+
+
+def murmur2_fingerprint(path: str | Path) -> int:
+    """计算 jar 的 CurseForge 指纹（剔除空白字节后 Murmur2，seed=1）。"""
+    data = Path(path).read_bytes().translate(None, CF_STRIPPED_BYTES)
+    return murmur2(data)
+
+
 class ModProviderError(Exception):
     pass
 
@@ -78,6 +118,9 @@ class ModFile:
     size: int = 0
     sha1: Optional[str] = None
     version: str = ""
+    # Modrinth 的发布时间（ISO 8601）；部分 Mod 的 jar 内版本号与平台版本号不一致，
+    # 判断"是否更新"只看哈希与发布时间，不看版本号字符串。
+    published_at: str = ""
     game_versions: list[str] = field(default_factory=list)
     dependencies: list[dict] = field(default_factory=list)
 
@@ -210,6 +253,7 @@ class ModrinthProvider(ModProvider):
                         size=int(entry.get("size") or 0),
                         sha1=hashes.get("sha1"),
                         version=version.get("version_number", ""),
+                        published_at=str(version.get("date_published") or ""),
                         game_versions=version.get("game_versions", []),
                         dependencies=version.get("dependencies", []),
                     )
@@ -323,6 +367,34 @@ class CurseForgeProvider(ModProvider):
             return None
         return self._file_from_item(project_id, data)
 
+    def fingerprint_lookup(self, fingerprints: list[int]) -> dict[int, dict]:
+        """按 Murmur2 指纹批量查询文件，返回 ``{指纹: exactMatches 项}``。"""
+        matches: dict[int, dict] = {}
+        for start in range(0, len(fingerprints), 100):
+            chunk = fingerprints[start : start + 100]
+            status, payload = net.request_json(
+                f"{CURSEFORGE_API}/fingerprints",
+                method="POST",
+                json_body={"fingerprints": chunk},
+                headers={**self._headers(), "Content-Type": "application/json"},
+                timeout=self.timeout,
+            )
+            if status != 200 or not isinstance(payload, dict):
+                continue
+            data = payload.get("data") or {}
+            for match in data.get("exactMatches") or []:
+                if not isinstance(match, dict):
+                    continue
+                file = match.get("file") or {}
+                hashes = {h.get("algo"): h.get("value") for h in file.get("hashes", [])}
+                value = hashes.get(2)
+                try:
+                    key = int(value)
+                except (TypeError, ValueError):
+                    continue
+                matches[key] = match
+        return matches
+
     def _file_from_item(self, project_id: str, item: dict) -> Optional[ModFile]:
         url = item.get("downloadUrl") or self._fetch_download_url(project_id, item.get("id"))
         if not url:
@@ -337,6 +409,7 @@ class CurseForgeProvider(ModProvider):
             size=int(item.get("fileLength") or 0),
             sha1=hashes.get(1) or hashes.get("sha1"),  # algo=1 表示 SHA1
             version=item.get("displayName", ""),
+            published_at=str(item.get("fileDate") or ""),
             game_versions=item.get("gameVersions", []),
             dependencies=item.get("dependencies", []),
         )

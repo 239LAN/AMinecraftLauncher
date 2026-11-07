@@ -65,6 +65,10 @@ class LauncherConfig:
     last_account: str = ""
     # 启动页登录方式：offline / microsoft，空表示按上次登录账号决定。
     login_mode: str = ""
+    # 启动器更新：auto（自动下载并安装）/ notify（只提醒）/ off（不检查）
+    launcher_update_mode: str = "notify"
+    # 已提醒/已安装的更新标识（版本|资产名|大小|更新时间），保证同一更新只提醒一次。
+    launcher_update_seen: str = ""
     # 版本级覆盖：{version_id: {key: value}}，只存被显式修改过的项。
     version_settings: dict = field(default_factory=dict)
 

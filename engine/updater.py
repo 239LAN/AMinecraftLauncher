@@ -71,8 +71,23 @@ def fetch_latest(*, timeout: int = 15) -> dict:
         "asset_name": str(asset.get("name") or ""),
         "url": str(asset.get("browser_download_url") or ""),
         "size": int(asset.get("size") or 0),
+        "asset_id": int(asset.get("id") or 0),
+        "asset_updated_at": str(asset.get("updated_at") or ""),
         "published_at": str(payload.get("published_at") or ""),
     }
+
+
+def asset_identity(info: dict) -> str:
+    """更新标识：同一版本 Release 的附件被替换时也要算作一次新更新。"""
+    return "|".join(
+        [
+            str(info.get("version") or ""),
+            str(info.get("asset_name") or ""),
+            str(info.get("size") or 0),
+            str(info.get("asset_updated_at") or ""),
+            str(info.get("asset_id") or 0),
+        ]
+    )
 
 
 def fetch_releases(limit: int = 8, *, timeout: int = 10) -> list[dict]:

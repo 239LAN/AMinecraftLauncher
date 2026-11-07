@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engine import auth_client, mod_provider
+from engine import auth_client, mod_provider, updater
 from engine.auth_client import (
     AuthClient,
     AuthError,
@@ -26,6 +26,8 @@ from engine.mod_provider import (
     ModrinthProvider,
     build_provider,
 )
+
+from app.services import launcher_update_available, pick_updated_file
 
 # --------------------------------------------------------------------- 认证
 DEVICE_CODE_PAYLOAD = {
@@ -285,6 +287,95 @@ class ModrinthTests(unittest.TestCase):
 
     def test_download_headers_empty(self) -> None:
         self.assertEqual(ModrinthProvider().download_headers(), {})
+
+
+class ModUpdateSelectionTest(unittest.TestCase):
+    """更新判断只认哈希与发布时间，不受 jar 内版本号影响。"""
+
+    @staticmethod
+    def _file(sha1: str, published: str, version: str = "") -> mod_provider.ModFile:
+        return mod_provider.ModFile(
+            source="modrinth",
+            project_id="proj",
+            file_id=sha1,
+            filename="mod.jar",
+            url="https://cdn/mod.jar",
+            sha1=sha1,
+            version=version,
+            published_at=published,
+        )
+
+    def test_picks_latest_publish_time(self) -> None:
+        current = self._file("a" * 40, "2026-01-01T00:00:00Z")
+        files = [
+            current,
+            # jar 里写的版本号比平台版本号小，但发布时间确实更晚。
+            self._file("c" * 40, "2026-03-01T00:00:00Z", "1.0.0"),
+            self._file("b" * 40, "2026-02-01T00:00:00Z", "9.9.9"),
+        ]
+        picked = pick_updated_file(files, current.sha1, current.published_at)
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.sha1, "c" * 40)
+
+    def test_older_build_is_not_an_update(self) -> None:
+        files = [
+            self._file("a" * 40, "2026-05-01T00:00:00Z"),
+            self._file("b" * 40, "2026-04-01T00:00:00Z"),
+        ]
+        self.assertIsNone(pick_updated_file(files, "a" * 40, "2026-05-01T00:00:00Z"))
+
+    def test_falls_back_without_publish_time(self) -> None:
+        files = [self._file("a" * 40, ""), self._file("b" * 40, "")]
+        picked = pick_updated_file(files, "a" * 40, "")
+        self.assertEqual(picked.sha1, "b" * 40)
+
+
+class CurseForgeFingerprintTest(unittest.TestCase):
+    """CurseForge 指纹会先剔除空白字节，再做 Murmur2。"""
+
+    def test_whitespace_bytes_are_stripped(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "plain.jar"
+            spaced = Path(tmp) / "spaced.jar"
+            plain.write_bytes(b"PK\x03\x04content")
+            spaced.write_bytes(b"PK\x03\x04 con\ttent\r\n")
+            self.assertEqual(
+                mod_provider.murmur2_fingerprint(plain),
+                mod_provider.murmur2_fingerprint(spaced),
+            )
+            other = Path(tmp) / "other.jar"
+            other.write_bytes(b"PK\x03\x04other")
+            self.assertNotEqual(
+                mod_provider.murmur2_fingerprint(plain),
+                mod_provider.murmur2_fingerprint(other),
+            )
+
+
+class LauncherUpdateAvailabilityTest(unittest.TestCase):
+    """启动器更新：新版本算更新；同版本仅当附件标识变化时算更新。"""
+
+    def test_newer_version(self) -> None:
+        self.assertTrue(launcher_update_available("1.6.0", "1.5.3", "id", ""))
+
+    def test_same_version_without_history_is_not_update(self) -> None:
+        self.assertFalse(launcher_update_available("1.5.3", "1.5.3", "id", ""))
+
+    def test_same_version_same_asset_is_not_update(self) -> None:
+        self.assertFalse(
+            launcher_update_available("1.5.3", "1.5.3", "1.5.3|a.exe|10|x|1", "1.5.3|a.exe|10|x|1")
+        )
+
+    def test_same_release_changed_asset_counts_as_update(self) -> None:
+        self.assertTrue(
+            launcher_update_available("1.5.3", "1.5.3", "1.5.3|a.exe|11|y|2", "1.5.3|a.exe|10|x|1")
+        )
+
+    def test_identity_changes_with_asset_fields(self) -> None:
+        base = {"version": "1.5.3", "asset_name": "a.exe", "size": 10, "asset_updated_at": "x", "asset_id": 1}
+        changed = dict(base, size=11)
+        self.assertNotEqual(updater.asset_identity(base), updater.asset_identity(changed))
 
 
 if __name__ == "__main__":
