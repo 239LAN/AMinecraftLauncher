@@ -293,6 +293,8 @@ def detect_lan_port(log_path: Optional[Path], *, default: int = 25565) -> int:
         r"Local game hosted on port (\d+)",
         r"Started serving on (\d+)",
         r"LAN server (?:running|started) on (?:port )?(\d+)",
+        # 26.x 起的新日志文案
+        r"Published LAN server on port (\d+)",
     ]
     port = 0
     for pattern in patterns:
@@ -380,6 +382,10 @@ def list_listening_ports() -> list[int]:
                 ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True,
                 text=True,
+                # 中文 Windows 的 netstat 输出是 OEM 代码页（GBK），
+                # Python 3.15 起 text=True 默认按 UTF-8 解码会直接抛异常。
+                encoding="oem",
+                errors="replace",
                 timeout=8,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
             )

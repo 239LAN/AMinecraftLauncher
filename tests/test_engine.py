@@ -401,5 +401,24 @@ class DownloaderTest(unittest.TestCase):
             Downloader(workers=1).download([self._entry(dest)], cancel=lambda: True)
 
 
+class MirrorCandidateTest(unittest.TestCase):
+    """GitHub Release 资源优先走公共代理（Adoptium 等直连经常卡住）。"""
+
+    def test_github_url_gets_proxy_first(self) -> None:
+        from engine.mirror import MirrorManager
+
+        manager = MirrorManager()
+        url = "https://github.com/adoptium/temurin25-binaries/releases/download/x/y.zip"
+        candidates = manager.candidates(url)
+        self.assertEqual(candidates[0], f"https://v6.gh-proxy.org/{url}")
+        self.assertIn(url, candidates)
+
+    def test_non_github_url_untouched(self) -> None:
+        from engine.mirror import MirrorManager
+
+        manager = MirrorManager()
+        self.assertEqual(manager.candidates("https://example.com/a.zip"), ["https://example.com/a.zip"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

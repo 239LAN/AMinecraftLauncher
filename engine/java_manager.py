@@ -23,6 +23,8 @@ from .rules import detect_os_arch, detect_os_name
 
 # Adoptium API v3：取某个 feature version 的最新 JRE。
 ADOPTIUM_API = "https://api.adoptium.net/v3/assets/latest"
+# 清华 TUNA 的 Adoptium 镜像：国内下载明显快于 GitHub Release。
+ADOPTIUM_MIRROR = "https://mirrors.tuna.tsinghua.edu.cn/Adoptium"
 PROBE_TIMEOUT = 10
 # Adoptium API 在部分网络下不可达，超时设短一点，失败时尽快给出明确提示。
 ADOPTIUM_TIMEOUT = 12
@@ -64,6 +66,16 @@ class JavaRuntime:
     size: int
     sha1: str = ""
     vendor: str = ""
+
+
+def adoptium_mirror_candidates(runtime: JavaRuntime) -> list[str]:
+    """清华 TUNA 的 Adoptium 镜像地址；目录结构与官方 Release 一致。"""
+    filename = runtime.url.rsplit("/", 1)[-1]
+    if not filename or "/" in filename:
+        return []
+    return [
+        f"{ADOPTIUM_MIRROR}/{runtime.major}/jre/{runtime.arch}/{runtime.os}/{filename}"
+    ]
 
 
 # --------------------------------------------------------------------- 纯函数
@@ -560,12 +572,17 @@ class JavaManager:
             if progress:
                 progress(delta)
 
+        candidates: list[str] = []
+        for item in [*adoptium_mirror_candidates(runtime), *net.url_candidates(runtime.url)]:
+            if item not in candidates:
+                candidates.append(item)
         net.download_file(
             runtime.url,
             archive,
             expected_size=runtime.size,
             on_chunk=_on_chunk,
             cancel=cancel,
+            candidates=candidates,
         )
 
         if target_dir.exists():

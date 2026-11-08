@@ -68,6 +68,13 @@ class LanPortTest(unittest.TestCase):
     def test_missing_log_falls_back(self) -> None:
         self.assertEqual(relay.detect_lan_port(Path("no-such.log")), 25565)
 
+    def test_detects_new_lan_log_text(self) -> None:
+        # 26.x 的日志文案，旧正则匹配不到会退回默认 25565。
+        log = self.write_log(
+            "[23:30:04] [Render thread/INFO]: Published LAN server on port 51234\n"
+        )
+        self.assertEqual(relay.detect_lan_port(log), 51234)
+
     def test_visitor_port_is_free(self) -> None:
         port = relay.pick_free_port()
         self.assertGreaterEqual(port, relay.DEFAULT_BIND_RANGE[0])

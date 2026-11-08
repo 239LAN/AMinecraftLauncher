@@ -21,6 +21,14 @@ from . import net
 
 BMCLAPI_ROOT = "https://bmclapi2.bangbang93.com"
 
+# 公共 GitHub 代理：Adoptium 的 JRE 等资源托管在 GitHub Release 上，直连经常卡住。
+GH_PROXY = "https://v6.gh-proxy.org/"
+GITHUB_RELEASE_PREFIXES = (
+    "https://github.com/",
+    "https://objects.githubusercontent.com/",
+    "https://release-assets.githubusercontent.com/",
+)
+
 # 前缀重写规则：命中后拼到镜像根上。顺序敏感，长的前缀必须排在短的前面。
 BMCLAPI_RULES: list[tuple[str, str]] = [
     ("https://launchermeta.mojang.com", BMCLAPI_ROOT),
@@ -104,9 +112,12 @@ class MirrorManager:
         if self.active != SOURCE_BMCLAPI:
             return [url]
         mirrored = rewrite(url)
-        if not mirrored or mirrored == url:
-            return [url]
-        return [mirrored, url]
+        result = [mirrored, url] if mirrored and mirrored != url else [url]
+        if url.startswith(GITHUB_RELEASE_PREFIXES):
+            proxied = f"{GH_PROXY}{url}"
+            if proxied not in result:
+                result.insert(0, proxied)
+        return result
 
     def dual_source(self) -> bool:
         """镜像与官方源是否都可用（决定是否让两个源同时承担分片下载）。"""

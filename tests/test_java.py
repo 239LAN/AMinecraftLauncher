@@ -18,7 +18,9 @@ from engine.java_manager import (
     JavaError,
     JavaInfo,
     JavaManager,
+    JavaRuntime,
     adoptium_arch,
+    adoptium_mirror_candidates,
     adoptium_os_name,
     parse_java_version_output,
 )
@@ -246,6 +248,28 @@ class ScanDedupeTest(JavaManagerTestCase):
         self.assertEqual(majors, [17])
         self.assertEqual(infos[0].version, "17.0.9")
         self.assertEqual(infos[0].source, "downloaded")
+
+
+class AdoptiumMirrorTest(unittest.TestCase):
+    def test_mirror_candidate_from_release_url(self) -> None:
+        runtime = JavaRuntime(
+            major=25,
+            version="25.0.5",
+            os="windows",
+            arch="x64",
+            url=(
+                "https://github.com/adoptium/temurin25-binaries/releases/download/"
+                "jdk-25.0.5%2B8/OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip"
+            ),
+            size=58589419,
+        )
+        self.assertEqual(
+            adoptium_mirror_candidates(runtime),
+            [
+                "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/25/jre/x64/windows/"
+                "OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip"
+            ],
+        )
 
 
 if __name__ == "__main__":
