@@ -4568,8 +4568,20 @@ class LauncherUI:
             return
         if inline:
             self._finish_home_launch("")
+            # 有些崩溃（缺原生库等）发生在启动后的几秒内，此时已经提示过成功，
+            # 这里补一次延迟检查，避免「界面没反应、也没报错」。
+            ui.timer(10.0, self._warn_game_exited, once=True)
             return
         self._launch_done = True
+
+    def _warn_game_exited(self) -> None:
+        if self._home_launching or self.service.has_running_game():
+            return
+        ui.notify(
+            "游戏已退出，启动输出保存在 data/logs/game-*.log",
+            type="warning",
+            position="top-right",
+        )
 
 
     # =================================================================== 联机

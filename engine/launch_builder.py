@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .models import Account, GamePaths, ResolvedVersion
-from .rules import rules_allow
+from .rules import detect_os_arch, detect_os_name, rules_allow
 from .version import APP_NAME as LAUNCHER_NAME
 from .version import APP_VERSION as LAUNCHER_VERSION
 
@@ -20,6 +20,28 @@ _UNRESOLVED = re.compile(r"\$\{[^}]+\}")
 
 DEFAULT_WIDTH = 854
 DEFAULT_HEIGHT = 480
+
+# 新版原生包内部按 ``<平台>/<架构>/`` 分目录（如 windows/x64/org/lwjgl/...）。
+NATIVE_PLATFORM_ROOTS = {"windows", "linux", "macos"}
+NATIVE_OS_DIR = {"windows": "windows", "osx": "macos", "linux": "linux"}
+
+
+def _jvm_uses_java_natives_dir(jvm_args) -> bool:
+    """新版 JSON 把原生库目录设为 ``${natives_directory}/java``。"""
+    for arg in jvm_args or []:
+        values = arg.get("value") if isinstance(arg, dict) else arg
+        parts = values if isinstance(values, list) else [values]
+        for item in parts:
+            if isinstance(item, str) and "${natives_directory}/java" in item:
+                return True
+    return False
+
+
+def _has_platform_subdirs(members: list[str]) -> bool:
+    return any(
+        "/" in item and item.split("/", 1)[0] in NATIVE_PLATFORM_ROOTS
+        for item in members
+    )
 
 
 def offline_uuid(username: str) -> str:
@@ -103,11 +125,24 @@ class LaunchBuilder:
         return [java or self.paths.java, *jvm, resolved.main_class, *game]
 
     def extract_natives(self, resolved: ResolvedVersion) -> Path:
-        """清空并重建 natives 目录，解压所有原生库。"""
+        """清空并重建 natives 目录，解压所有原生库。
+
+        新版（26.x）原生包内部按 ``<平台>/<架构>/`` 分目录，且 JVM 参数把
+        ``java.library.path`` 指到 ``natives/java``；此时需要按当前平台前缀
+        过滤，并把 dll 扁平化放进 ``natives/java``，否则 ``System.loadLibrary``
+        找不到 lwjgl.dll（其它架构的同名包也必须跳过）。
+        """
         natives_dir = resolved.natives_dir
         if natives_dir.exists():
             shutil.rmtree(natives_dir)
         natives_dir.mkdir(parents=True, exist_ok=True)
+
+        new_layout = _jvm_uses_java_natives_dir(resolved.jvm_args)
+        os_dir = NATIVE_OS_DIR.get(detect_os_name(), detect_os_name())
+        arch = detect_os_arch()
+        prefix = f"{os_dir}/{arch}/"
+        target_root = natives_dir / "java" if new_layout else natives_dir
+        target_root.mkdir(parents=True, exist_ok=True)
 
         for lib in resolved.libraries:
             native = lib.native_jar
@@ -117,12 +152,29 @@ class LaunchBuilder:
             if not native_path.exists():
                 continue
             with zipfile.ZipFile(native_path) as archive:
-                for member in archive.namelist():
-                    if member.endswith("/"):
-                        continue
-                    if any(member.startswith(prefix) for prefix in lib.exclude):
-                        continue
-                    archive.extract(member, natives_dir)
+                members = [
+                    item
+                    for item in archive.namelist()
+                    if not item.endswith("/")
+                    and not any(item.startswith(item_prefix) for item_prefix in lib.exclude)
+                ]
+                if not members:
+                    continue
+                if _has_platform_subdirs(members):
+                    if not any(item.startswith(prefix) for item in members):
+                        continue  # 其它平台 / 架构的原生包
+                for member in members:
+                    relative = member
+                    if member.startswith(prefix):
+                        relative = member[len(prefix) :]
+                    if new_layout:
+                        # 扁平化：Java 只在 library.path 一级目录里找 dll
+                        target = target_root / Path(relative).name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(member) as src, target.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    else:
+                        archive.extract(member, natives_dir)
         return natives_dir
 
     def describe(self, command: Sequence[str]) -> str:

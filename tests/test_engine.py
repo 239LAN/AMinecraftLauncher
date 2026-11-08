@@ -420,5 +420,65 @@ class MirrorCandidateTest(unittest.TestCase):
         self.assertEqual(manager.candidates("https://example.com/a.zip"), ["https://example.com/a.zip"])
 
 
+class NativesExtractionTest(unittest.TestCase):
+    """26.x 原生包按 <平台>/<架构>/ 分目录，需要扁平化进 natives/java。"""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.natives = self.root / "natives"
+
+    def _make_jar(self, name: str, entries: dict[str, bytes]) -> Path:
+        import zipfile
+
+        path = self.root / name
+        with zipfile.ZipFile(path, "w") as archive:
+            for member, data in entries.items():
+                archive.writestr(member, data)
+        return path
+
+    def _resolved(self, jars: list[Path], jvm_args: list[str]):
+        from types import SimpleNamespace
+
+        libraries = [
+            SimpleNamespace(
+                native_jar=SimpleNamespace(target_path=str(path)),
+                exclude=("META-INF/",),
+            )
+            for path in jars
+        ]
+        return SimpleNamespace(
+            natives_dir=self.natives, jvm_args=jvm_args, libraries=libraries
+        )
+
+    def test_legacy_flat_natives(self) -> None:
+        from engine.launch_builder import LaunchBuilder
+
+        jar = self._make_jar("legacy.jar", {"lwjgl.dll": b"x"})
+        resolved = self._resolved([jar], ["-Djava.library.path=${natives_directory}"])
+        LaunchBuilder(GamePaths(self.root)).extract_natives(resolved)
+        self.assertTrue((self.natives / "lwjgl.dll").is_file())
+
+    def test_new_layout_flattens_and_skips_other_arch(self) -> None:
+        from unittest import mock
+
+        from engine import launch_builder
+        from engine.launch_builder import LaunchBuilder
+
+        x64 = self._make_jar("x64.jar", {"windows/x64/org/lwjgl/lwjgl.dll": b"x64"})
+        arm = self._make_jar("arm.jar", {"windows/arm64/org/lwjgl/lwjgl.dll": b"arm"})
+        resolved = self._resolved(
+            [x64, arm], ["-Djava.library.path=${natives_directory}/java"]
+        )
+        with mock.patch.object(
+            launch_builder, "detect_os_name", return_value="windows"
+        ), mock.patch.object(launch_builder, "detect_os_arch", return_value="x64"):
+            LaunchBuilder(GamePaths(self.root)).extract_natives(resolved)
+
+        target = self.natives / "java" / "lwjgl.dll"
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"x64")
+        self.assertFalse((self.natives / "windows").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
