@@ -60,6 +60,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(python -c "from engine.version import APP_VERSION; print(APP_VERSION)")
+          # 先复制成规范文件名：GitHub 会把资产名里的空格转换成点
+          cp "dist/${VERSION}/A Minecraft Launcher" "AMinecraftLauncher-${VERSION}-linux-x86_64"
           gh release upload "${{ inputs.tag }}" \
-            "dist/${VERSION}/A Minecraft Launcher#AMinecraftLauncher-${VERSION}-linux-x86_64" \
+            "AMinecraftLauncher-${VERSION}-linux-x86_64" \
             --clobber
