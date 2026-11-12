@@ -181,5 +181,87 @@ class VersionMetaTests(MetaTestCase):
         self.assertEqual(version_meta.read_meta(self.paths, "原版备份")["game_version"], "1.20.1")
 
 
+class VersionCompleteTests(MetaTestCase):
+    """安装完成标记与「文件是否齐全」判定。"""
+
+    ASSET_HASH = "d" * 40
+
+    def _make_version(
+        self, version_id: str = "1.20.1", *, jar: bool = True, assets: bool = True
+    ) -> None:
+        directory = self.paths.version_dir(version_id)
+        directory.mkdir(parents=True)
+        payload = {
+            "id": version_id,
+            "downloads": {
+                "client": {
+                    "url": "https://example.invalid/client.jar",
+                    "sha1": "a" * 40,
+                    "size": 3,
+                }
+            },
+            "libraries": [],
+            "assetIndex": {
+                "id": "5",
+                "url": "https://example.invalid/5.json",
+                "sha1": "b" * 40,
+                "size": 2,
+            },
+        }
+        (directory / f"{version_id}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        if jar:
+            (directory / f"{version_id}.jar").write_bytes(b"jar")
+        if assets:
+            index = self.paths.assets_dir / "indexes" / "5.json"
+            index.parent.mkdir(parents=True, exist_ok=True)
+            index.write_text(
+                json.dumps({"objects": {"a.txt": {"hash": self.ASSET_HASH, "size": 1}}}),
+                encoding="utf-8",
+            )
+            obj = self.paths.assets_dir / "objects" / self.ASSET_HASH[:2] / self.ASSET_HASH
+            obj.parent.mkdir(parents=True, exist_ok=True)
+            obj.write_bytes(b"x")
+
+    def test_marker_roundtrip(self) -> None:
+        self._make_version()
+        self.assertFalse(version_meta.is_complete(self.paths, "1.20.1"))
+        version_meta.mark_complete(self.paths, "1.20.1")
+        self.assertTrue(version_meta.is_complete(self.paths, "1.20.1"))
+
+    def test_complete_version(self) -> None:
+        self._make_version()
+        self.assertTrue(version_meta.files_complete(self.paths, "1.20.1"))
+        self.assertTrue(version_meta.files_complete(self.paths, "1.20.1", asset_cache=set()))
+
+    def test_missing_asset_object_is_incomplete(self) -> None:
+        self._make_version()
+        obj = self.paths.assets_dir / "objects" / self.ASSET_HASH[:2] / self.ASSET_HASH
+        obj.unlink()
+        self.assertFalse(version_meta.files_complete(self.paths, "1.20.1"))
+
+    def test_missing_jar_is_incomplete(self) -> None:
+        self._make_version(jar=False)
+        self.assertFalse(version_meta.files_complete(self.paths, "1.20.1"))
+
+    def test_missing_json_is_incomplete(self) -> None:
+        self.assertFalse(version_meta.files_complete(self.paths, "1.20.1"))
+
+    def test_json_only_is_incomplete(self) -> None:
+        directory = self.paths.version_dir("破损")
+        directory.mkdir(parents=True)
+        (directory / "破损.json").write_text('{"id": "破损"}', encoding="utf-8")
+        self.assertFalse(version_meta.files_complete(self.paths, "破损"))
+
+    def test_inherited_version_uses_parent_jar(self) -> None:
+        self._make_version("1.20.1")
+        child = self.paths.version_dir("fabric-1.20.1")
+        child.mkdir(parents=True)
+        payload = {"id": "fabric-1.20.1", "inheritsFrom": "1.20.1", "libraries": []}
+        (child / "fabric-1.20.1.json").write_text(json.dumps(payload), encoding="utf-8")
+        self.assertTrue(version_meta.files_complete(self.paths, "fabric-1.20.1"))
+
+
 if __name__ == "__main__":
     unittest.main()

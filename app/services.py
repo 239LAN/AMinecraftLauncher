@@ -578,6 +578,9 @@ class LauncherService:
             return set()
         # 安装任务进行中时不做清理，避免误删正在写入的版本目录。
         cleanup = not self._has_active_tasks()
+        paths = self.paths()
+        # 多个版本共享同一批资源对象，扫描时复用已确认存在的哈希。
+        asset_cache: set[str] = set()
         installed: set[str] = set()
         for child in versions_dir.iterdir():
             if not child.is_dir():
@@ -587,9 +590,18 @@ class LauncherService:
                     shutil.rmtree(child, ignore_errors=True)
                     self.log(f"已清理中断安装的版本：{child.name}")
                 continue
-            if self._version_usable(child):
+            if version_meta.is_complete(paths, child.name):
                 installed.add(child.name)
-            elif cleanup:
+                continue
+            # 没有完成标记：只有文件确实齐全的旧版本才补写标记并列出，
+            # 装到一半的目录保持隐藏（也可以由同版本重新安装补齐）。
+            if cleanup and version_meta.files_complete(
+                paths, child.name, asset_cache=asset_cache
+            ):
+                version_meta.mark_complete(paths, child.name)
+                installed.add(child.name)
+                continue
+            if cleanup and not self._version_usable(child):
                 shutil.rmtree(child, ignore_errors=True)
                 self.log(f"已清理中断安装的版本：{child.name}")
         return installed
@@ -708,6 +720,7 @@ class LauncherService:
                 f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
             )
         task.log(f"原版文件就绪：下载 {stats.files_downloaded} 个，跳过 {stats.files_skipped} 个")
+        version_meta.mark_complete(self.paths(), version)
 
     def start_install(
         self,
@@ -763,6 +776,8 @@ class LauncherService:
                 version_meta.clone_version(self.paths(), target, target_name, meta)
                 task.log(f"已创建独立版本：{target_name}")
                 target = target_name
+            # 到此所有文件与元数据都已落盘，才允许出现在版本列表里。
+            version_meta.mark_complete(self.paths(), target)
 
             task.result = {
                 "version": version,
@@ -811,6 +826,7 @@ class LauncherService:
                 raise RuntimeError(
                     f"{len(stats.failed)} 个文件下载失败，首个错误：{stats.failed[0][1]}"
                 )
+            version_meta.mark_complete(self.paths(), version)
 
         name = f"补全 {version} 文件"
         existing = self._find_active_task(name)
@@ -909,6 +925,7 @@ class LauncherService:
                     f"原版文件就绪：下载 {stats.files_downloaded} 个，"
                     f"跳过 {stats.files_skipped} 个"
                 )
+                version_meta.mark_complete(self.paths(), game_version)
             if loader in ("forge", "neoforge"):
                 # Forge / NeoForge 安装器需要用对应版本的 Java 运行。
                 java = self._loader_java(task, game_version)
@@ -933,6 +950,7 @@ class LauncherService:
             if target_name and target_name != target:
                 version_meta.clone_version(self.paths(), target, target_name, meta)
                 target = target_name
+            version_meta.mark_complete(self.paths(), target)
             task.result = {
                 "version_id": target,
                 "loader": result.loader,
@@ -2164,6 +2182,7 @@ class LauncherService:
                 f"原版文件就绪：下载 {stats.files_downloaded} 个，"
                 f"跳过 {stats.files_skipped} 个"
             )
+            version_meta.mark_complete(self.paths(), base)
 
         if not loader:
             version_meta.write_meta(
@@ -2241,6 +2260,7 @@ class LauncherService:
                 "format": info.format,
                 "file_count": info.file_count,
             }
+            version_meta.mark_complete(self.paths(), target)
             task.log(f"整合包导入完成：{info.name} → {target}")
 
         label = f"导入整合包 {archive.name}"
@@ -2355,6 +2375,7 @@ class LauncherService:
                 "game_version": info.game_version,
                 "loader": info.loader,
             }
+            version_meta.mark_complete(self.paths(), target)
             task.log(f"整合包安装完成：{info.name} → {target}")
 
         name = f"安装整合包 {label}"

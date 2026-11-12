@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -341,7 +342,7 @@ body {
 .aml-bar-fill {
   height: 100%; width: 0%; border-radius: 999px;
   background: var(--aml-accent);
-  transition: width .3s ease;
+  transition: width .2s linear;
 }
 
 .aml-fade { animation: aml-fade .2s ease backwards; }
@@ -508,6 +509,43 @@ FIT_SCRIPT = """
     try { window.close(); } catch (err) {}
   }, 4000);
 })();
+</script>
+"""
+
+# 进度过渡：每 250ms 同步一次，数字在 200ms 内按 0.01% 一档走到目标值，
+# 进度条宽度交给 CSS transition 播放同样的 200ms 动画，剩余 50ms 停顿。
+PROGRESS_SCRIPT = """
+<script>
+window.amlProgress = function (labelId, barId, target, duration) {
+  duration = duration || 200;
+  target = Math.max(0, Math.min(100, Number(target) || 0));
+  var label = labelId ? document.getElementById(labelId) : null;
+  var bar = barId ? document.getElementById(barId) : null;
+  var host = label || bar;
+  if (!host) return;
+  var state = host.__amlProgress || (host.__amlProgress = {value: 0, raf: 0});
+  if (state.raf) { cancelAnimationFrame(state.raf); state.raf = 0; }
+  if (bar) bar.style.width = target.toFixed(2) + '%';
+  var from = state.value;
+  if (Math.abs(target - from) < 0.005) {
+    state.value = target;
+    if (label) label.textContent = target.toFixed(1) + '%';
+    return;
+  }
+  var started = performance.now();
+  var step = function (now) {
+    var t = Math.min(1, (now - started) / duration);
+    var value = Math.round((from + (target - from) * t) * 100) / 100;
+    state.value = value;
+    if (label) label.textContent = value.toFixed(1) + '%';
+    if (t < 1) {
+      state.raf = requestAnimationFrame(step);
+    } else {
+      state.raf = 0;
+    }
+  };
+  state.raf = requestAnimationFrame(step);
+};
 </script>
 """
 
@@ -740,6 +778,7 @@ class LauncherUI:
         self._task_status: dict[str, str] = {}
         self._task_speed: dict[str, float] = {}
         self._task_widgets: dict[str, dict] = {}
+        self._overview_widgets: dict[str, object] = {}
         self._cancelling: set[str] = set()
         self._speed_sample: Optional[tuple[float, dict[str, int]]] = None
         self._is_maximized = False
@@ -784,6 +823,7 @@ class LauncherUI:
     async def build(self) -> None:
         ui.add_head_html(f"<style>{AML_CSS}</style>")
         ui.add_head_html(FIT_SCRIPT)
+        ui.add_head_html(PROGRESS_SCRIPT)
         ui.dark_mode().value = False
         ui.colors(
             primary="#2563eb",
@@ -807,7 +847,7 @@ class LauncherUI:
         self._build_launch_dialog()
         if self.debug:
             ui.timer(1.0, self._refresh_logs)
-        ui.timer(0.5, self._poll_tasks)
+        ui.timer(0.25, self._poll_tasks)
         self._select_view("home")
         # 启动后静默检查一次更新；不阻塞启动，也避免频繁请求。
         ui.timer(2.0, self._silent_update_check, once=True)
@@ -993,11 +1033,13 @@ class LauncherUI:
             self.launch_title = ui.label("正在启动").classes("text-[16px] font-semibold")
             self.launch_detail = ui.label("准备中…").classes("aml-sub")
             with ui.element("div").classes("aml-bar-track w-full"):
-                self.launch_fill = ui.element("div").classes("aml-bar-fill")
-            with ui.row().classes("w-full items-center justify-between no-wrap"):
-                self.launch_percent = ui.label("0%").classes("text-[12px] font-semibold").style(
-                    "color: var(--aml-accent)"
+                self.launch_fill = ui.element("div").classes("aml-bar-fill").props(
+                    "id=aml-launch-bar"
                 )
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                self.launch_percent = ui.label("0.0%").classes(
+                    "text-[12px] font-semibold"
+                ).props("id=aml-launch-pct").style("color: var(--aml-accent)")
                 self.launch_cancel_btn = ui.button("取消", on_click=self._cancel_launch).props(
                     "flat dense no-caps color=negative"
                 )
@@ -1007,13 +1049,22 @@ class LauncherUI:
                 "flat dense no-caps"
             )
             self.launch_close_btn.set_visibility(False)
-        self._launch_timer = ui.timer(0.15, self._sync_launch_dialog, active=False)
-        self._home_launch_timer = ui.timer(0.2, self._sync_home_launch, active=False)
+        self._launch_timer = ui.timer(0.25, self._sync_launch_dialog, active=False)
+        self._home_launch_timer = ui.timer(0.25, self._sync_home_launch, active=False)
+
+    def _animate_progress(
+        self, label_id: Optional[str], bar_id: Optional[str], percent: float
+    ) -> None:
+        """数字用 JS 在 200ms 内插值到目标值；进度条宽度由 CSS transition 播放动画。"""
+        value = max(0.0, min(100.0, float(percent or 0.0)))
+        ui.run_javascript(
+            "window.amlProgress("
+            f"{json.dumps(label_id)}, {json.dumps(bar_id)}, {value:.2f}, 200);"
+        )
 
     def _apply_launch_progress(self) -> None:
         percent = max(0.0, min(100.0, float(self._launch_progress.get("percent") or 0.0)))
-        self.launch_fill.style(f"width: {percent:.1f}%")
-        self.launch_percent.text = f"{percent:.1f}%"
+        self._animate_progress("aml-launch-pct", "aml-launch-bar", percent)
         if self._launch_cancel.is_set() and not self._launch_done:
             self.launch_detail.text = "正在取消…"
         else:
@@ -1035,8 +1086,7 @@ class LauncherUI:
             self.launch_error.set_visibility(True)
             return
 
-        self.launch_fill.style("width: 100%")
-        self.launch_percent.text = "100%"
+        self._animate_progress("aml-launch-pct", "aml-launch-bar", 100.0)
         ui.notify(str(self._launch_progress.get("detail") or "已启动"), type="positive", position="top-right")
         self._refresh_home()
         ui.timer(0.9, self.launch_dialog.close, once=True)
@@ -1249,7 +1299,9 @@ class LauncherUI:
                 ui.label("正在启动游戏").classes("text-[17px] font-semibold")
                 self.home_launch_step = ui.label("准备中…").classes("aml-sub")
                 with ui.element("div").classes("aml-bar-track w-[220px]"):
-                    self.home_launch_fill = ui.element("div").classes("aml-bar-fill")
+                    self.home_launch_fill = ui.element("div").classes(
+                        "aml-bar-fill"
+                    ).props("id=aml-home-bar")
             return
 
         account = self._active_account()
@@ -1520,7 +1572,7 @@ class LauncherUI:
             )
         fill = getattr(self, "home_launch_fill", None)
         if fill is not None:
-            fill.style(f"width: {percent:.1f}%")
+            self._animate_progress(None, "aml-home-bar", percent)
 
     def _cancel_home_launch(self) -> None:
         self._launch_cancel.set()
@@ -3673,8 +3725,10 @@ class LauncherUI:
         return min(100.0, max(0.0, percent))
 
     def _render_task_overview(self, snapshots: list[dict]) -> None:
-        self.task_overview.clear()
         if not snapshots:
+            if self._overview_widgets:
+                self.task_overview.clear()
+                self._overview_widgets = {}
             return
 
         running = [snapshot for snapshot in snapshots if snapshot["status"] == "running"]
@@ -3696,60 +3750,78 @@ class LauncherUI:
         percent = min(100.0, max(0.0, percent))
 
         speed = self._total_speed(snapshots)
-        with self.task_overview:
-            with ui.column().classes("aml-card flat w-full p-5 gap-4"):
-                with ui.row().classes("w-full items-end gap-8 no-wrap"):
-                    with ui.column().classes("gap-0"):
-                        with ui.row().classes("items-center gap-2 no-wrap"):
-                            if running:
-                                ui.element("div").classes("aml-live-dot")
-                            ui.label("总进度").classes("aml-sub")
-                        ui.label(f"{percent:.1f}%").classes("aml-big-num").style(
-                            "font-size: 34px"
-                        )
-                    with ui.column().classes("gap-0"):
-                        ui.label("总速度").classes("aml-sub")
-                        ui.label(_fmt_speed(speed)).classes("text-[20px] font-semibold")
-                    with ui.column().classes("gap-0"):
-                        ui.label("进行中").classes("aml-sub")
-                        ui.label(f"{len(running)} 个").classes("text-[20px] font-semibold")
-                    ui.space()
-                    with ui.column().classes("items-end gap-0"):
-                        ui.label("已传输").classes("aml-sub")
-                        ui.label(
-                            f"{_fmt_size(done_bytes)} / {_fmt_size(total_bytes)}"
-                            if total_bytes
-                            else f"{len(snapshots)} 个任务"
-                        ).classes("text-[13px] font-medium")
-                with ui.element("div").classes("aml-bar-track w-full"):
-                    ui.element("div").classes("aml-bar-fill").style(f"width: {percent:.1f}%")
+
+        if not self._overview_widgets:
+            self.task_overview.clear()
+            with self.task_overview:
+                with ui.column().classes("aml-card flat w-full p-5 gap-4"):
+                    with ui.row().classes("w-full items-end gap-8 no-wrap"):
+                        with ui.column().classes("gap-0"):
+                            with ui.row().classes("items-center gap-2 no-wrap"):
+                                live = ui.element("div").classes("aml-live-dot")
+                                ui.label("总进度").classes("aml-sub")
+                            ui.label("0.0%").classes("aml-big-num").props(
+                                "id=aml-total-pct"
+                            ).style("font-size: 34px")
+                        with ui.column().classes("gap-0"):
+                            ui.label("总速度").classes("aml-sub")
+                            speed_label = ui.label("").classes("text-[20px] font-semibold")
+                        with ui.column().classes("gap-0"):
+                            ui.label("进行中").classes("aml-sub")
+                            running_label = ui.label("").classes("text-[20px] font-semibold")
+                        ui.space()
+                        with ui.column().classes("items-end gap-0"):
+                            ui.label("已传输").classes("aml-sub")
+                            bytes_label = ui.label("").classes("text-[13px] font-medium")
+                    with ui.element("div").classes("aml-bar-track w-full"):
+                        ui.element("div").classes("aml-bar-fill").props("id=aml-total-bar")
+            self._overview_widgets = {
+                "live": live,
+                "speed": speed_label,
+                "running": running_label,
+                "bytes": bytes_label,
+            }
+
+        widgets = self._overview_widgets
+        widgets["live"].set_visibility(bool(running))
+        widgets["speed"].text = _fmt_speed(speed)
+        widgets["running"].text = f"{len(running)} 个"
+        widgets["bytes"].text = (
+            f"{_fmt_size(done_bytes)} / {_fmt_size(total_bytes)}"
+            if total_bytes
+            else f"{len(snapshots)} 个任务"
+        )
+        self._animate_progress("aml-total-pct", "aml-total-bar", percent)
 
     def _create_task_row(self, snapshot: dict) -> None:
+        percent_id = f"aml-task-pct-{snapshot['id']}"
+        fill_id = f"aml-task-bar-{snapshot['id']}"
         with ui.column().classes("aml-task-row aml-fade w-full p-3.5 gap-2"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
                 with ui.row().classes("items-center gap-2 no-wrap min-w-0"):
                     ui.label(snapshot["name"]).classes("text-[14px] font-medium")
                     status_label = ui.label("").classes("aml-chip")
                 with ui.row().classes("items-center gap-2 no-wrap shrink-0"):
-                    percent_label = ui.label("").classes("text-[12px] font-semibold").style(
-                        "color: var(--aml-accent)"
-                    )
+                    percent_label = ui.label("0.0%").classes(
+                        "text-[12px] font-semibold"
+                    ).props(f"id={percent_id}").style("color: var(--aml-accent)")
                     speed_label = ui.label("").classes("aml-sub")
                     cancel_button = ui.button(
                         "取消",
                         on_click=lambda _=None, t=snapshot["id"]: self._cancel_task(t),
                     ).props("flat dense no-caps color=negative")
             with ui.element("div").classes("aml-bar-track w-full"):
-                fill = ui.element("div").classes("aml-bar-fill")
+                ui.element("div").classes("aml-bar-fill").props(f"id={fill_id}")
             detail_label = ui.label("").classes("aml-sub w-full").style(
                 "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
             )
         self._task_widgets[snapshot["id"]] = {
             "status": status_label,
+            "percent_id": percent_id,
+            "fill_id": fill_id,
             "percent": percent_label,
             "speed": speed_label,
             "cancel": cancel_button,
-            "fill": fill,
             "detail": detail_label,
         }
 
@@ -3772,7 +3844,7 @@ class LauncherUI:
 
         percent = self._task_percent(snapshot)
         widgets["percent"].set_visibility(status in {"running", "done"})
-        widgets["percent"].text = f"{percent:.1f}%"
+        self._animate_progress(widgets["percent_id"], widgets["fill_id"], percent)
 
         speed = self._task_speed.get(snapshot["id"], 0.0)
         show_speed = status == "running" and speed > 0 and not cancelling
@@ -3781,7 +3853,6 @@ class LauncherUI:
             widgets["speed"].text = _fmt_speed(speed)
 
         widgets["cancel"].set_visibility(status in {"pending", "running"} and not cancelling)
-        widgets["fill"].style(f"width: {percent:.1f}%")
         widgets["detail"].text = self._task_detail(snapshot)
 
     def _task_detail(self, snapshot: dict) -> str:
