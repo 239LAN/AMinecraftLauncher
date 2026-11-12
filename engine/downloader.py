@@ -115,14 +115,15 @@ class Downloader:
     def __init__(
         self,
         *,
-        workers: int = 32,
+        workers: int = 256,
         verify: bool = True,
         progress: Optional[ProgressFn] = None,
         timeout: int = 30,
         retries: int = 3,
         segment_threshold: int = 4 * 1024 * 1024,
     ) -> None:
-        self.workers = max(1, int(workers or 32))
+        # 上限 1024：线程数可由配置调整，但避免异常值起上千个连接。
+        self.workers = max(1, min(1024, int(workers or 256)))
         self.verify = verify
         self.progress = progress
         self.timeout = timeout

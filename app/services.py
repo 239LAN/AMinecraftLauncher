@@ -2583,6 +2583,11 @@ class LauncherService:
             if key in allowed:
                 setattr(self.config, key, value)
 
+        # 下载线程限制在 1-1024；配置文件被手改时也不会起几千个线程。
+        self.config.download_workers = max(
+            1, min(1024, int(self.config.download_workers or 256))
+        )
+
         if "root" in changes and changes["root"]:
             new_root = str(Path(str(changes["root"])).expanduser().resolve())
             self.config.root = new_root

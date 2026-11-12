@@ -420,6 +420,17 @@ class MirrorCandidateTest(unittest.TestCase):
         self.assertEqual(manager.candidates("https://example.com/a.zip"), ["https://example.com/a.zip"])
 
 
+class DownloaderWorkersTest(unittest.TestCase):
+    """下载线程默认 256、上限 1024，异常值自动收敛。"""
+
+    def test_default_and_clamp(self) -> None:
+        from engine.downloader import Downloader
+
+        self.assertEqual(Downloader().workers, 256)
+        self.assertEqual(Downloader(workers=5000).workers, 1024)
+        self.assertEqual(Downloader(workers=0).workers, 256)
+
+
 class NativesExtractionTest(unittest.TestCase):
     """26.x 原生包按 <平台>/<架构>/ 分目录，需要扁平化进 natives/java。"""
 

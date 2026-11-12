@@ -3904,7 +3904,7 @@ class LauncherUI:
             ui.label("CurseForge 通过 mcimirror 公共镜像访问，无需 API Key").classes("aml-sub")
             with ui.row().classes("w-full items-center gap-3 no-wrap"):
                 self.set_workers = ui.number(
-                    label="下载线程数", value=view["download_workers"], min=1, max=64, step=1
+                    label="下载线程数", value=view["download_workers"], min=1, max=1024, step=1
                 ).classes("flex-1").props("dense outlined")
                 self.set_mod_source = ui.select(
                     {"modrinth": "Modrinth", "curseforge": "CurseForge"},
@@ -4013,7 +4013,7 @@ class LauncherUI:
     async def _save_launcher_settings(self) -> None:
         changes = {
             "download_source": "auto" if self.set_mirror.value else "official",
-            "download_workers": int(self.set_workers.value or 32),
+            "download_workers": int(self.set_workers.value or 256),
             "mod_source": self.set_mod_source.value,
             "mod_loader": self.set_mod_loader.value,
             "include_snapshots": bool(self.set_include_snapshots.value),

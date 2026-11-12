@@ -53,7 +53,7 @@ class LauncherConfig:
     client_id: str = DEFAULT_CLIENT_ID
     last_version: str = ""
     include_snapshots: bool = False
-    download_workers: int = 32
+    download_workers: int = 256
     mod_source: str = "modrinth"
     mod_loader: str = "fabric"
     # 下载源：auto（镜像优先，失败回退官方）/ bmclapi / official
