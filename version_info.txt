@@ -1,7 +1,7 @@
 ﻿VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 6, 0),
-    prodvers=(1, 5, 6, 0),
+    filevers=(1, 6, 0, 0),
+    prodvers=(1, 6, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@
           [
             StringStruct("CompanyName", "AML"),
             StringStruct("FileDescription", "A Minecraft Launcher"),
-            StringStruct("FileVersion", "1.5.6"),
+            StringStruct("FileVersion", "1.6.0"),
             StringStruct("InternalName", "A Minecraft Launcher"),
             StringStruct("LegalCopyright", "Copyright (C) 2026"),
             StringStruct("OriginalFilename", "A Minecraft Launcher.exe"),
             StringStruct("ProductName", "A Minecraft Launcher"),
-            StringStruct("ProductVersion", "1.5.6"),
+            StringStruct("ProductVersion", "1.6.0"),
           ],
         )
       ]

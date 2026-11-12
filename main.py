@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 from nicegui import app, ui
@@ -42,11 +43,31 @@ def _webview_available() -> bool:
 _SINGLE_INSTANCE_HANDLE = None
 
 
+def _ensure_posix_lock() -> bool:
+    """POSIX 下用文件锁限制单实例（Linux/macOS 均可）。"""
+    global _SINGLE_INSTANCE_HANDLE
+    try:
+        import fcntl
+
+        lock_path = Path(tempfile.gettempdir()) / "aminecraftlauncher.lock"
+        handle = lock_path.open("w")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            print("启动器已经在运行。", file=sys.stderr)
+            return False
+        _SINGLE_INSTANCE_HANDLE = handle  # 持有到进程退出，锁才释放
+        return True
+    except Exception:  # noqa: BLE001 - 单实例失败不应阻止启动
+        return True
+
+
 def _ensure_single_instance() -> bool:
     """Windows 下只允许运行一个启动器；已有实例时把旧窗口提到前台。"""
     global _SINGLE_INSTANCE_HANDLE
     if os.name != "nt":
-        return True
+        return _ensure_posix_lock()
     try:
         import ctypes
         from ctypes import wintypes
@@ -100,8 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--debug", action="store_true", help="显示运行日志面板")
     args = parser.parse_args(argv)
 
-    # 桌面模式限制单实例，避免两个启动器同时拉起同一个游戏。
-    if not args.web and _webview_available() and not _ensure_single_instance():
+    # 未显式指定端口时限制单实例，避免两个启动器同时拉起同一个游戏。
+    if not args.port and not _ensure_single_instance():
         return 0
 
     service = build_app(debug=args.debug)
@@ -126,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         title=APP_NAME,
         native=native,
         reload=args.reload,
-        show=native,
+        show=True,  # 浏览器模式下自动打开默认浏览器；native 模式为显示窗口
         favicon=_icon_path(),
         uvicorn_logging_level="info" if args.debug else "warning",
     )

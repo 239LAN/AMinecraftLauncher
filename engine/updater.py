@@ -135,19 +135,25 @@ def _strip_title(body: str) -> str:
 
 
 def _pick_asset(assets: list) -> Optional[dict]:
-    executables = [
-        item
-        for item in assets
-        if isinstance(item, dict)
-        and str(item.get("name") or "").lower().endswith(".exe")
-        and item.get("browser_download_url")
-    ]
-    if not executables:
+    """按当前平台挑选安装包：Windows 取 .exe，Linux 取名称含 linux 的资产。"""
+    linux = sys.platform.startswith("linux")
+    candidates = []
+    for item in assets:
+        if not isinstance(item, dict) or not item.get("browser_download_url"):
+            continue
+        name = str(item.get("name") or "")
+        lower = name.lower()
+        if linux:
+            if "linux" in lower and not lower.endswith((".exe", ".zip", ".tar.gz", ".tar.xz")):
+                candidates.append(item)
+        elif lower.endswith(".exe"):
+            candidates.append(item)
+    if not candidates:
         return None
     preferred = [
-        item for item in executables if "aminecraftlauncher" in str(item.get("name") or "").lower()
+        item for item in candidates if "aminecraftlauncher" in str(item.get("name") or "").lower()
     ]
-    return (preferred or executables)[0]
+    return (preferred or candidates)[0]
 
 
 def download_urls(url: str) -> list[str]:
@@ -185,13 +191,15 @@ def download(
 
 
 def apply_update(new_exe: Path) -> Path:
-    """生成替换脚本并在后台启动，退出当前进程后覆盖原 exe 并重启。
+    """生成替换脚本并在后台启动，退出当前进程后覆盖原文件并重启。
 
     返回脚本路径，调用方随后应关闭启动器。
     """
     if not getattr(sys, "frozen", False):
         raise UpdateError("自动更新仅在打包版可用")
     exe = Path(sys.executable)
+    if os.name != "nt":
+        return _apply_update_posix(exe, Path(new_exe).resolve())
     script = exe.parent / "aml-update.ps1"
     name = exe.stem.replace("'", "''")
     new_path = Path(new_exe).resolve()
@@ -233,9 +241,42 @@ def _ps_literal(path: Path) -> str:
     return str(path).replace("'", "''")
 
 
+def _sh_quote(value: object) -> str:
+    """Shell 单引号转义。"""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def _apply_update_posix(exe: Path, new_exe: Path) -> Path:
+    """Linux/macOS：等启动器退出后覆盖可执行文件并重新启动。"""
+    script = exe.parent / "aml-update.sh"
+    lines = [
+        "#!/bin/sh",
+        "sleep 1",
+        f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.5; done",
+        "i=0",
+        "while [ $i -lt 30 ]; do",
+        f"  if cp -f {_sh_quote(new_exe)} {_sh_quote(exe)}; then",
+        f"    chmod +x {_sh_quote(exe)}",
+        "    break",
+        "  fi",
+        "  i=$((i + 1))",
+        "  sleep 1",
+        "done",
+        f"( {_sh_quote(exe)} >/dev/null 2>&1 & )",
+        'rm -f "$0"',
+    ]
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(0o755)
+    subprocess.Popen(["/bin/sh", str(script)], start_new_session=True, close_fds=True)
+    return script
+
+
 def update_target() -> Path:
-    """更新文件落盘位置：打包版放在 exe 同级，源码模式放在 data/updates。"""
+    """更新文件落盘位置：打包版放在可执行文件同级，源码模式放在 data/updates。"""
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable)
-        return exe.with_name(f"{exe.stem}-update.exe")
-    return Path(os.getcwd()) / "data" / "updates" / "A Minecraft Launcher-update.exe"
+        if os.name == "nt":
+            return exe.with_name(f"{exe.stem}-update.exe")
+        return exe.with_name(f"{exe.name}-update")
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(os.getcwd()) / "data" / "updates" / f"A Minecraft Launcher-update{suffix}"

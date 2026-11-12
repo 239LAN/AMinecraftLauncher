@@ -378,5 +378,34 @@ class LauncherUpdateAvailabilityTest(unittest.TestCase):
         self.assertNotEqual(updater.asset_identity(base), updater.asset_identity(changed))
 
 
+class UpdaterAssetTest(unittest.TestCase):
+    """发布资产要按平台挑选：Windows 用 .exe，Linux 用 linux_x86_64 文件。"""
+
+    @staticmethod
+    def _assets() -> list[dict]:
+        return [
+            {
+                "name": "AMinecraftLauncher-1.6.0.exe",
+                "browser_download_url": "https://example.com/win.exe",
+                "size": 100,
+            },
+            {
+                "name": "AMinecraftLauncher-1.6.0-linux-x86_64",
+                "browser_download_url": "https://example.com/linux",
+                "size": 200,
+            },
+        ]
+
+    def test_windows_picks_exe(self) -> None:
+        with mock.patch.object(updater.sys, "platform", "win32"):
+            asset = updater._pick_asset(self._assets())
+        self.assertEqual(asset["name"], "AMinecraftLauncher-1.6.0.exe")
+
+    def test_linux_picks_linux_binary(self) -> None:
+        with mock.patch.object(updater.sys, "platform", "linux"):
+            asset = updater._pick_asset(self._assets())
+        self.assertEqual(asset["name"], "AMinecraftLauncher-1.6.0-linux-x86_64")
+
+
 if __name__ == "__main__":
     unittest.main()
